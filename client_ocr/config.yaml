@@ -1,0 +1,50 @@
+api_url: "http://192.168.13.176:5030/ocr/process"
+# api_url: "http://localhost:5030/ocr/process"
+
+# Options: General, KTP, KK, NPWP, Invoice, Quotation
+# document_type: "Invoice"
+
+# fields:
+#   - invoice_date
+#   - invoice_number
+#   - total_amount
+#   - sales_order
+#   - remark
+
+# prompt: invoice_prompt.txt
+
+dpi_pdf: 150  #150 maximum
+
+# document_type: "Quotation"
+
+# fields:
+#  - date
+#  - quotation_no
+#  - sales_agent
+#  - no_telp
+#  - material_code
+#  - material_descriptions
+#  - UoM
+#  - currency
+#  - quantity
+#  - unit_price
+#  - purchasing_group
+#  - plant
+#  - lead_time
+#  - submitted_by
+
+# prompt: client_ocr\purchasing_prompt.txt
+
+
+document_type: "KTP"
+
+fields:
+  - nik
+  - nama_lengkap
+  - tempat_tanggal_lahir
+  - jenis_kelamin
+  - alamat
+
+
+prompt: prompt.txt
+

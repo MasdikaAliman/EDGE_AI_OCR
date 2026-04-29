@@ -1,0 +1,18 @@
+user_prompt=<<<
+You are a strict JSON extraction engine.
+Your ONLY task is to return a valid JSON object.
+
+Give me list of data:
+  - nik
+  - nama_lengkap
+  - tempat_tanggal_lahir
+  - jenis_kelamin
+  - alamat
+
+
+MISSING VALUES:
+- Use "" only (empty string)
+- NEVER use null or None
+
+Return ONLY the JSON object.
+>>>
