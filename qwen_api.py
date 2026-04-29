@@ -1,28 +1,109 @@
+import base64
+import io
+import json
+import logging
+import re
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
-from typing import List, Dict, Any
 from PIL import Image
-import base64
-import json
-import math
-import re
-import io
-import logging
-from typing import Union, Literal, Optional
-from prompts import DOCUMENT_PROMPTS, DEFAULT_USER_PROMPTS, get_prompt
 
+
+from prompts import DEFAULT_USER_PROMPTS, DOCUMENT_PROMPTS, get_prompt
+from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Literal, Optional, Union
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+
+
+DocumentType = Literal["General", "KTP", "KK", "NPWP", "Invoice", "Quotation", "SIM", "STNK", "Passport"]
+
+MAX_IMAGES = 5
+ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff"}
+
+
+
+
+
+class ImageUrl(BaseModel):
+    """Base64 data URI wrapper.  External http/https URLs are rejected."""
+    url: str = Field(
+        ...,
+        description=(
+            "Base64-encoded image URI: 'data:image/<mime>;base64,<data>'. "
+            "External http/https URLs are NOT accepted."
+        ),
+        examples=["data:image/jpeg;base64,/9j/4AAQ..."],
+    )
+
+
+class TextContent(BaseModel):
+    """Plain-text message item."""
+    type: Literal["text"]
+    text: str = Field(..., examples=["Extract all fields from this invoice"])
+
+
+class ImageContent(BaseModel):
+    """Image message item using OpenAI-compatible image_url structure."""
+    type: Literal["image_url"]
+    image_url: ImageUrl
+
+
+class OCRJsonRequest(BaseModel):
+    """
+    Request body for **JSON** mode of `POST /ocr/process`.
+
+    - **document_type**: Picks the specialized extraction prompt.
+      Choices: General, KTP, KK, NPWP, Invoice, Quotation, SIM, STNK, Passport.
+    - **fields** *(optional)*: If supplied, the model extracts **only** these
+      snake_case field names and ignores document-type defaults.
+    - **content**: Ordered list of text/image items.
+      Must contain at least one `image_url`. Max {MAX_IMAGES} images.
+    """
+
+    document_type: DocumentType = Field(
+        default="General",
+        description="Document type — selects the matching extraction prompt.",
+        examples=["Invoice"],
+    )
+    fields: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Optional list of snake_case field names to extract. "
+            "When omitted, the default fields for the chosen document_type are used."
+        ),
+        examples=[["invoice_number", "total", "buyer_name"]],
+    )
+    content: List[Union[TextContent, ImageContent]] = Field(
+        ...,
+        description=(
+            f"Ordered content items. At least one image_url required. "
+            f"Max {MAX_IMAGES} image_url items. "
+            "Optionally prepend a text item with a custom instruction."
+        ),
+        examples=[
+            [
+                {"type": "text", "text": "Extract all fields"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/..."}},
+            ]
+        ],
+    )
+
+
 app = FastAPI(
     title="Document OCR API",
-    description="API for OCR extraction from images using LLM.",
-    version="2.0.0"
+    description=(
+        "High-precision document OCR powered by Qwen3-VL via vLLM.\n\n"
+        "Accepts images as **base64 JSON** or **multipart file uploads**.\n\n"
+        "Supported document types: "
+        + ", ".join(DOCUMENT_PROMPTS.keys())
+    ),
+    version="3.0.0",
 )
 
 BASE_URL_LLM = "http://192.168.13.176:8053"
@@ -32,64 +113,18 @@ model = init_chat_model(
     model_provider="openai",
     base_url=BASE_URL_LLM + "/v1",
     api_key="EMPTY",
-    temperature=0.0
+    temperature=0.0,
 )
 
 
-class ImageUrl(BaseModel):
-    """Target image URL — must be a base64 data URI (e.g. 'data:image/jpeg;base64,...'). External http/https URLs are rejected."""
-    url: str = Field(
-        ...,
-        description="Base64-encoded image URI in the format 'data:image/<mime>;base64,<data>'. External URLs (http/https) are NOT allowed.",
-        examples=["data:image/jpeg;base64,/9j/4AAQ..."]
-    )
-
-class TextContent(BaseModel):
-    """A plain text message item in the content list."""
-    type: Literal["text"] = Field(..., description="Content item type. Must be 'text'.")
-    text: str = Field(..., description="The text instruction or prompt to send alongside the image(s).", examples=["Extract all fields from this invoice"])
-
-class ImageContent(BaseModel):
-    """An image item in the content list, wrapped in the OpenAI-compatible image_url structure."""
-    type: Literal["image_url"] = Field(..., description="Content item type. Must be 'image_url'.")
-    image_url: ImageUrl = Field(..., description="The image URL wrapper containing the base64 data URI.")
-
-class MessageContent(BaseModel):
-    """
-    Main request body for POST /ocr/process.
-
-    - **document_type**: Selects the specialized system prompt for the document. Defaults to 'General'. Options: General, KTP, KK, NPWP, Invoice, Quotation, SIM.
-    - **fields**: Optional. If provided, the AI will extract ONLY these fields and name them exactly as listed.
-    - **content**: List of text and/or image items. At least one image_url is required.
-
-    **Max 5 images per request.**
-    """
-    document_type: Literal["General", "KTP", "KK", "NPWP", "Invoice", "Quotation", "SIM"] = Field(
-        default="General",
-        description="Document type determines which specialized extraction prompt is used automatically.\nOptions: General, KTP, KK, NPWP, Invoice, Quotation, SIM.",
-        examples=["Invoice"]
-    )
-    fields: Optional[List[str]] = Field(
-        default=None,
-        description="Optional list of exact snake_case field names to extract. \nIf provided, the AI returns ONLY these keys. If omitted, the default fields for the document_type are used.",
-    )
-    content: List[Union[TextContent, ImageContent]] = Field(
-        ...,
-        description="Ordered list of content items. Include at least one image_url. Optionally prepend a text item for a custom instruction. Maximum 5 image_url items.",
-        examples=[[
-            {"type": "text", "text": "Extract all fields"},
-            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/..."}}
-        ]]
-    )
-
-
-
-def preprocess_image(base64_str: str, max_size: int = 1024) -> str:
-    with io.BytesIO(base64.b64decode(base64_str)) as src:
+def _preprocess_image(b64_data: str, max_size: int = 1024) -> str:
+    """Decode → resize if needed → re-encode as JPEG base64."""
+    raw_bytes = base64.b64decode(b64_data)
+    with io.BytesIO(raw_bytes) as src:
         img = Image.open(src)
-        img.load()  # force load before BytesIO closes
-    img = img.convert("RGB")
+        img.load()
 
+    img = img.convert("RGB")
     if max(img.size) > max_size:
         img.thumbnail((max_size, max_size), Image.LANCZOS)
 
@@ -100,264 +135,428 @@ def preprocess_image(base64_str: str, max_size: int = 1024) -> str:
     img.close()
     return result
 
-def sanitize_content(content: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Walk through message content and preprocess any images found."""
+
+def _file_to_content_item(raw_bytes: bytes, content_type: str) -> Dict[str, Any]:
+    """Convert raw image bytes into an OpenAI-compatible image_url content dict."""
+    mime = content_type.split(";")[0].strip().lower()
+    if mime not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "success": False,
+                "error_type": "unsupported_media_type",
+                "message": (
+                    f"File type '{mime}' is not supported. "
+                    f"Accepted types: {', '.join(sorted(ALLOWED_MIME_TYPES))}."
+                ),
+            },
+        )
+    b64 = base64.b64encode(raw_bytes).decode("utf-8")
+    cleaned = _preprocess_image(b64)
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:{mime};base64,{cleaned}"},
+    }
+
+
+def _sanitize_content(content: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     sanitized = []
     for item in content:
         if item.get("type") == "image_url":
             raw_url: str = item["image_url"]["url"]
 
-            # Reject external URLs — server must not download remote images
             if raw_url.startswith(("http://", "https://")):
                 raise HTTPException(
                     status_code=400,
                     detail={
                         "success": False,
                         "error_type": "url_not_allowed",
-                        "message": "External image URLs are not supported. Please send images as base64 data URIs or upload files via multipart/form-data.",
-                    }
+                        "message": (
+                            "External image URLs are not supported. "
+                            "Send images as base64 data URIs or upload via multipart/form-data."
+                        ),
+                    },
                 )
 
-            # Extract base64 data (handles "data:image/...;base64,<data>")
             if ";base64," in raw_url:
                 prefix, b64_data = raw_url.split(";base64,", 1)
-                cleaned_b64 = preprocess_image(b64_data)
-                item = {**item, "image_url": {"url": f"{prefix};base64,{cleaned_b64}"}}
+                cleaned = _preprocess_image(b64_data)
+                item = {**item, "image_url": {"url": f"{prefix};base64,{cleaned}"}}
 
         sanitized.append(item)
     return sanitized
 
-def clean_json_response(content: str) -> str:
+
+def _clean_json_response(content: str) -> str:
+    """Strip markdown fences and extract the first JSON object/array."""
     if "```json" in content:
         content = content.split("```json")[1].split("```")[0].strip()
     elif "```" in content:
         content = content.split("```")[1].split("```")[0].strip()
+
     content = content.strip()
-    if '{' in content:
-        content = content[content.find('{'):]
-    elif '[' in content:
-        content = content[content.find('['):]
-    if '}' in content:
-        content = content[:content.rfind('}') + 1]
-    elif ']' in content:
-        content = content[:content.rfind(']') + 1]
-    content = re.sub(r',(\s*[}\]])', r'\1', content)
+
+    # Advance to first JSON character
+    if "{" in content:
+        content = content[content.find("{"):]
+    elif "[" in content:
+        content = content[content.find("["):]
+
+    # Trim trailing garbage after closing bracket
+    if "}" in content:
+        content = content[: content.rfind("}") + 1]
+    elif "]" in content:
+        content = content[: content.rfind("]") + 1]
+
+    # Remove trailing commas before } or ]
+    content = re.sub(r",(\s*[}\]])", r"\1", content)
     return content
 
 
-MAX_IMAGES = 5
 
-async def process_ocr(req: MessageContent) -> dict:
-    doc_type = req.document_type
-    # Use get_prompt() — if user supplied fields, it injects them into the prompt
-    system_prompt = get_prompt(doc_type, req.fields)
-    system_message = SystemMessage(content=system_prompt)
+async def _run_ocr(
+    document_type: str,
+    raw_content: List[Dict[str, Any]],
+    fields: Optional[List[str]] = None,
+) -> dict:
+    """
+    Shared processing logic.
 
-    raw_content = [item.model_dump() for item in req.content]
+    Args:
+        document_type: One of the keys in DOCUMENT_PROMPTS.
+        raw_content:   List of plain dicts with 'type' == 'text' or 'image_url'.
+        fields:        Optional list of field names to override defaults.
 
-    # Validate image count before sending to vLLM
+    Returns:
+        {"success": True, "data": <extracted dict>}
+
+    Raises:
+        HTTPException on all known failure modes.
+    """
+    # ── Validate image count ───────────────────────────────────────────────────
     image_count = sum(1 for item in raw_content if item.get("type") == "image_url")
+
+    if image_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error_type": "no_image_provided",
+                "message": "At least one image is required.",
+            },
+        )
+
     if image_count > MAX_IMAGES:
         raise HTTPException(
             status_code=400,
             detail={
                 "success": False,
                 "error_type": "image_limit_exceeded",
-                "message": f"Too many images. Maximum allowed is {MAX_IMAGES}, but {image_count} were provided.",
-            }
+                "message": (
+                    f"Too many images. Maximum is {MAX_IMAGES}, "
+                    f"but {image_count} were provided."
+                ),
+            },
         )
 
-    # If user didn't provide a text prompt, inject the default one for the document type
     has_text = any(item.get("type") == "text" for item in raw_content)
     if not has_text:
-        default_prompt = DEFAULT_USER_PROMPTS.get(doc_type, DEFAULT_USER_PROMPTS["General"])
-        raw_content.insert(0, {"type": "text", "text": default_prompt})
+        default_prompt = DEFAULT_USER_PROMPTS.get(document_type, DEFAULT_USER_PROMPTS["General"])
+        raw_content = [{"type": "text", "text": default_prompt}] + raw_content
 
-    clean_content = sanitize_content(raw_content)
+    clean_content = _sanitize_content(raw_content)
+
+    system_prompt = get_prompt(document_type, fields)
     messages = [
-        system_message,
-        HumanMessage(content=clean_content)
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=clean_content),
     ]
 
     try:
         response = model.invoke(messages)
-        extracted_data = json.loads(clean_json_response(response.content))
+        extracted_data = json.loads(_clean_json_response(response.content))
         return {"success": True, "data": extracted_data}
 
     except json.JSONDecodeError as e:
-        logger.error(f"JSON parsing error: {e}")
+        logger.error("JSON parsing error: %s", e)
         raise HTTPException(
             status_code=422,
             detail={
                 "success": False,
                 "error_type": "json_parse_error",
-                "message": "Model returned malformed JSON",
+                "message": "Model returned malformed JSON.",
                 "detail": str(e),
-            }
+            },
         )
 
     except Exception as e:
-        error_str = str(e)
-        if "Error code: 400" in error_str or "BadRequestError" in error_str:
-            inner_msg = error_str
-            try:
-                import re
-                match = re.search(r"'message':\s*'([^']+)'", error_str)
-                if match:
-                    inner_msg = match.group(1)
-            except Exception :
-                pass
+        _handle_llm_exception(e)
 
-            logger.error(f"vLLM bad request: {inner_msg}")
+
+def _handle_llm_exception(exc: Exception) -> None:
+    err = str(exc)
+
+    checks = [
+        (
+            "Error code: 400" in err or "BadRequestError" in err,
+            400,
+            "llm_bad_request",
+            _extract_inner_message(err),
+            "Input is likely too long. Reduce image size or text length.",
+        ),
+        (
+            "Error code: 401" in err,
+            401,
+            "llm_auth_error",
+            "Unauthorized — check your LLM API key.",
+            None,
+        ),
+        (
+            "Error code: 429" in err,
+            429,
+            "llm_rate_limit",
+            "LLM server is overloaded. Retry after a moment.",
+            None,
+        ),
+        (
+            "Error code: 503" in err or "Error code: 500" in err,
+            502,
+            "llm_server_error",
+            "LLM backend returned a server error.",
+            None,
+        ),
+        (
+            "ConnectionError" in type(exc).__name__ or "ConnectError" in err,
+            503,
+            "llm_unreachable",
+            f"Cannot connect to LLM server at {BASE_URL_LLM}.",
+            None,
+        ),
+        (
+            "TimeoutError" in type(exc).__name__ or "timed out" in err.lower(),
+            504,
+            "llm_timeout",
+            "LLM server did not respond in time. Try a smaller image.",
+            None,
+        ),
+    ]
+
+    for condition, status, error_type, message, hint in checks:
+        if condition:
+            detail: Dict[str, Any] = {
+                "success": False,
+                "error_type": error_type,
+                "message": message,
+            }
+            if hint:
+                detail["hint"] = hint
+            logger.error("vLLM error [%s]: %s", error_type, message)
+            raise HTTPException(status_code=status, detail=detail)
+
+
+    logger.error("Unhandled processing error [%s]: %s", type(exc).__name__, err)
+    raise HTTPException(
+        status_code=500,
+        detail={
+            "success": False,
+            "error_type": "internal_error",
+            "message": f"Unexpected error: {type(exc).__name__}",
+            "detail": err,
+        },
+    )
+
+
+def _extract_inner_message(error_str: str) -> str:
+    """Try to pull the human-readable message out of a vLLM 400 error string."""
+    try:
+        match = re.search(r"'message':\s*'([^']+)'", error_str)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return error_str
+
+
+
+@app.post(
+    "/ocr/process",
+    summary="Extract document fields (JSON body — base64 images)",
+    tags=["OCR"],
+)
+async def process_ocr_json(req: OCRJsonRequest):
+    """
+    **JSON mode** — send images as base64 data URIs inside the `content` array.
+
+    ```json
+    {
+      "document_type": "Invoice",
+      "fields": ["invoice_number", "total"],   // optional
+      "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+      ]
+    }
+    ```
+    """
+    try:
+        raw_content = [item.model_dump() for item in req.content]
+        return await _run_ocr(req.document_type, raw_content, req.fields)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Unexpected error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+
+@app.post(
+    "/ocr/process/upload",
+    summary="Extract document fields (multipart — file upload)",
+    tags=["OCR"],
+)
+async def process_ocr_upload(
+    files: List[UploadFile] = File(
+        ...,
+        description=(
+            f"One or more image files to process (max {MAX_IMAGES}). "
+            "Accepted formats: JPEG, PNG, WebP, GIF, TIFF."
+        ),
+    ),
+    document_type: DocumentType = Form(
+        default="General",
+        description="Document type. Options: " + ", ".join(DOCUMENT_PROMPTS.keys()),
+    ),
+    fields: Optional[str] = Form(
+        default=None,
+        description=(
+            "Optional JSON array of snake_case field names to extract. "
+            'Example: ["invoice_number","total","buyer_name"]'
+        ),
+    ),
+    custom_prompt: Optional[str] = Form(
+        default=None,
+        description=(
+            "Optional custom instruction prepended to the model input. "
+            "If omitted, the default instruction for the document_type is used."
+        ),
+    ),
+):
+    """
+    **Multipart mode** — upload image files directly from disk.
+
+    Send a `multipart/form-data` POST with:
+    - `files`: one or more image files
+    - `document_type`: e.g. `KTP` (default: `General`)
+    - `fields` *(optional)*: JSON array string, e.g. `["full_name","nik"]`
+    - `custom_prompt` *(optional)*: override the default user instruction
+
+    ```bash
+    curl -X POST http://localhost:5030/ocr/process/upload \\
+      -F "files=@id_card.jpg" \\
+      -F "document_type=KTP" \\
+      -F 'fields=["full_name","nik","birth_date"]'
+    ```
+    """
+    # ── Parse optional `fields` form value (comes in as a raw JSON string) ─────
+    parsed_fields: Optional[List[str]] = None
+    if fields:
+        try:
+            parsed_fields = json.loads(fields)
+            if not isinstance(parsed_fields, list) or not all(
+                isinstance(f, str) for f in parsed_fields
+            ):
+                raise ValueError("fields must be a JSON array of strings.")
+        except (json.JSONDecodeError, ValueError) as e:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "success": False,
+                    "error_type": "invalid_fields_format",
+                    "message": (
+                        f"'fields' must be a valid JSON array of strings. Error: {e}. "
+                        'Example: ["invoice_number","total"]'
+                    ),
+                },
+            )
+
+    # ── Build content list from uploaded files ─────────────────────────────────
+    raw_content: List[Dict[str, Any]] = []
+
+    if custom_prompt:
+        raw_content.append({"type": "text", "text": custom_prompt})
+
+    for upload in files:
+        content_type = upload.content_type or "application/octet-stream"
+        raw_bytes = await upload.read()
+
+        if not raw_bytes:
             raise HTTPException(
                 status_code=400,
                 detail={
                     "success": False,
-                    "error_type": "llm_bad_request",
-                    "message": inner_msg,
-                    "hint": "Input is likely too long. Reduce image size or text length.",
-                }
+                    "error_type": "empty_file",
+                    "message": f"Uploaded file '{upload.filename}' is empty.",
+                },
             )
 
-        if "Error code: 401" in error_str:
-            logger.error(f"vLLM auth error: {error_str}")
+        try:
+            raw_content.append(_file_to_content_item(raw_bytes, content_type))
+        except HTTPException:
+            raise
+        except Exception as e:
             raise HTTPException(
-                status_code=401,
+                status_code=400,
                 detail={
                     "success": False,
-                    "error_type": "llm_auth_error",
-                    "message": "Unauthorized check your LLM API key.",
-                }
+                    "error_type": "file_read_error",
+                    "message": f"Could not process file '{upload.filename}': {e}",
+                },
             )
 
-        if "Error code: 429" in error_str:
-            logger.error(f"vLLM rate limit: {error_str}")
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "success": False,
-                    "error_type": "llm_rate_limit",
-                    "message": "LLM server is overloaded. Retry after a moment.",
-                }
-            )
-
-        if "Error code: 503" in error_str or "Error code: 500" in error_str:
-            logger.error(f"vLLM server error: {error_str}")
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "success": False,
-                    "error_type": "llm_server_error",
-                    "message": "LLM backend returned a server error.",
-                    "detail": error_str,
-                }
-            )
-
-        if "ConnectionError" in type(e).__name__ or "ConnectError" in error_str:
-            logger.error(f"Cannot reach vLLM server: {error_str}")
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "success": False,
-                    "error_type": "llm_unreachable",
-                    "message": f"Cannot connect to LLM server at {BASE_URL_LLM}.",
-                }
-            )
-
-        if "TimeoutError" in type(e).__name__ or "timed out" in error_str.lower():
-            logger.error(f"vLLM request timed out: {error_str}")
-            raise HTTPException(
-                status_code=504,
-                detail={
-                    "success": False,
-                    "error_type": "llm_timeout",
-                    "message": "LLM server did not respond in time. Try a smaller image.",
-                }
-            )
-
-
-        logger.error(f"Unhandled processing error [{type(e).__name__}]: {error_str}")
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "success": False,
-                "error_type": "internal_error",
-                "message": f"Unexpected error: {type(e).__name__}",
-                "detail": error_str,
-            }
-        )
-
-@app.post("/ocr/process")
-async def process_image_ocr(req: MessageContent):
     try:
-        return await process_ocr(req)
+        return await _run_ocr(document_type, raw_content, parsed_fields)
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected error: {str(e)}"
-        )
+        logger.error("Unexpected error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 
-@app.get("/health")
+@app.get("/health", tags=["Utility"])
 async def health_check():
+    """Check connectivity to the vLLM backend."""
+    base_info = {
+        "vllm_max_model_len": 11000,
+        "max_image_size": "1024×1024",
+        "max_images_per_request": MAX_IMAGES,
+    }
     try:
-        response = requests.get(f"{BASE_URL_LLM}/health", timeout=5)
-
-        if response.status_code == 200:
-            return {
-                "status": "Healthy",
-                "model_ready": True,
-                "vllm_max_model_len": 11000,
-                "width": 512,
-                "height": 512
-            }
-        else:
-            return {
-                "status": f"Unhealthy (code: {response.status_code})",
-                "model_ready": False,
-                "vllm_max_model_len": 11000,
-                "width": 512,
-                "height": 512
-            }
-
+        resp = requests.get(f"{BASE_URL_LLM}/health", timeout=5)
+        if resp.status_code == 200:
+            return {"status": "Healthy", "model_ready": True, **base_info}
+        return {
+            "status": f"Unhealthy (HTTP {resp.status_code})",
+            "model_ready": False,
+            **base_info,
+        }
     except requests.exceptions.ConnectionError:
-        return {
-            "status": "vLLM server not reachable",
-            "model_ready": False,
-            "vllm_max_model_len": 11000,
-            "width": 512,
-            "height": 512
-        }
-
+        return {"status": "vLLM server not reachable", "model_ready": False, **base_info}
     except requests.exceptions.Timeout:
-        return {
-            "status": "vLLM server timeout",
-            "model_ready": False,
-            "vllm_max_model_len": 11000,
-            "width": 512,
-            "height": 512
-        }
-
+        return {"status": "vLLM server timeout", "model_ready": False, **base_info}
     except Exception as e:
-        return {
-            "status": f"Unexpected error: {str(e)}",
-            "model_ready": False,
-            "vllm_max_model_len": 11000,
-            "width": 512,
-            "height": 512
-        }
+        return {"status": f"Unexpected error: {e}", "model_ready": False, **base_info}
 
 
-@app.get("/")
+@app.get("/", tags=["Utility"])
 async def root():
     return {
         "name": "Document OCR API",
-        "version": "2.0.0",
-        "endpoints": {"image_ocr_process": "/ocr/process", "health": "/health"},
-        "docs": "/docs"
+        "version": "3.0.0",
+        "supported_document_types": list(DOCUMENT_PROMPTS.keys()),
+        "endpoints": {
+            "json_ocr":    "POST /ocr/process",
+            "upload_ocr":  "POST /ocr/process/upload",
+            "health":      "GET  /health",
+            "docs":        "GET  /docs",
+        },
     }
 
 
