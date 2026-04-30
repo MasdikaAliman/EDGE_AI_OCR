@@ -44,19 +44,176 @@ NPWP_PROMPT = f"""
 INVOICE_PROMPT = f"""
 **Role:** You are an expert OCR engine specialized in Invoice / Receipt documents.
 {BASE_DIRECTIVES}
-**Expected Fields:**
-- Top-level: `invoice_number`, `invoice_date`, `due_date`, `seller_name`, `seller_address`, `buyer_name`, `buyer_address`, `subtotal`, `tax`, `discount`, `total`, `currency`, `payment_method`, `notes`.
-- `line_items`: an array of objects, each with: `item_number`, `description`, `quantity`, `unit`, `unit_price`, `amount`.
-- Preserve exact numeric values as strings if they contain formatting (e.g., "1,500.00").
+
+**output_schema**
+Return exactly this structure:
+{{
+  "invoice_number": "",
+  "invoice_date": "",
+  "due_date": "",
+  "purchase_order": "",
+  "total_amount": "",
+  "currency": "",
+  "sales_order": "",
+  "remark": "",
+  "items": [
+    {{
+      "qty": "",
+      "description": "",
+      "unit_price": "",
+      "amount": ""
+    }}
+  ]
+}}
+
+
+**field_rules**
+## HEADER FIELDS
+Scan the top portion and top-right corner of the document.
+
+- invoice_number:
+  Triggers: "Invoice #", "Invoice No", "Invoice No.", "Document No", "Doc No", "No."
+  Extract the alphanumeric identifier that follows.
+
+- invoice_date:
+  Triggers: "Invoice Date", "Date", "Issued", "Issue Date"
+  Extract exactly as written (e.g., "15 Jan 2025", "01/15/2025").
+
+- due_date:
+  Triggers: "Due Date", "Payment Due", "Pay By", "Due"
+  Extract exactly as written.
+
+- purchase_order:
+  Triggers: "P.O.#", "P.O. No", "PO", "Purchase Order", "PO Number"
+  Extract the identifier. If multiple PO references exist, use the one in the header. Use "" if absent.
+
+## CURRENCY
+- Extract the symbol only (e.g., "$", "Rp", "€", "£", "¥").
+- Do NOT include the symbol inside total_amount.
+- If currency is written as a code (USD, IDR), extract the code.
+- If no currency found → "".
+
+## TOTAL AMOUNT
+Priority order — use the FIRST match found from top to bottom:
+  1. "TOTAL" (standalone, all-caps)
+  2. "Grand Total"
+  3. "Total Due"
+  4. "Total Payable"
+  5. "Amount Due"
+Exclude: "Subtotal", "Sub Total", "Tax", "VAT", "Discount", "Shipping"
+Extract the numeric value only (no currency symbol).
+
+## SALES ORDER
+Scan these locations in order:
+  1. Dedicated label near header: "Sales Order", "S.O.", "SO No", "Order No"
+  2. Description column of every line item row
+  3. Footer / remarks area
+
+Pattern matching (case-insensitive):
+  - "SO-XXXXX" or "SO XXXXX" (e.g., SO-10234, SO 99871)
+  - "S.O." followed by identifier
+  - "Sales Order" followed by identifier
+  - "Order No" / "Order Number" followed by identifier
+
+## REMARK
+Extract ONLY human-written, meaningful notes. Examples of valid remarks:
+  - "Partial delivery — remaining items on backorder"
+  - "Approved by: John Doe"
+  - "Price agreed on 10 Jan 2025"
+
+IGNORE and DO NOT extract:
+  - "Thank you for your business"
+  - Payment instructions or bank details
+  - Terms & conditions boilerplate
+  - System-generated or template text
+If no valid remark exists → ""
+
+**items_extraction
+## STEP 1 — LOCATE THE TABLE
+Find a structured grid/table with column headers. Common header variations:
+  QTY / Qty / Quantity / No.
+  Description / Item / Details / Product / Service
+  Unit Price / Price / Rate / U/Price
+  Amount / Total / Line Total / Ext. Price
+
+## STEP 2 — PARSE ROWS
+- Each data row = one item object.
+- Preserve original top-to-bottom order.
+- DO NOT include rows for: Subtotal, Tax, VAT, Discount, Grand Total, or any summary line.
+
+## STEP 3 — FIELD MAPPING PER ROW
+  qty         → value from QTY/Quantity column
+  description → full cell text; if multi-line, join with a single space " "
+  unit_price  → per-unit price value (no currency symbol)
+  amount      → row total/extended price (no currency symbol)
+
+## STEP 4 — EDGE CASES
+- Column missing entirely → fill its field with ""
+- Partial/malformed row → include it with "" for unreadable fields
+- Table structure ambiguous or undetectable → items = []
+- DO NOT calculate, validate, or cross-check any numeric values
+
+
+**layout_hints
+Use these spatial anchors to locate data faster:
+  - Invoice metadata (number, date, PO) → top-left or top-right block
+  - Buyer/seller info → upper section
+  - Line items table → center/body of document
+  - Totals block → bottom-right corner (highest priority region)
+  - Remarks/notes → bottom-left or below the totals
+  - Headers on multi-page docs may repeat — deduplicate values
 """
 
 QUOTATION_PROMPT = f"""
 **Role:** You are an expert OCR engine specialized in Quotation / Price Quote documents.
 {BASE_DIRECTIVES}
-**Expected Fields:**
-- Top-level: `quotation_number`, `quotation_date`, `valid_until`, `company_name`, `company_address`, `client_name`, `client_address`, `subtotal`, `tax`, `discount`, `total`, `currency`, `terms_and_conditions`, `notes`.
-- `line_items`: an array of objects, each with: `item_number`, `description`, `quantity`, `unit`, `unit_price`, `amount`.
-- Preserve exact numeric values as strings.
+**FIELD EXTRACTION PROTOCOL (Qwen3VL-SPECIFIC):**  
+**Critical visual cues for Qwen3VL:**  
+- **RED/BLUE TEXT PRIORITY:** Material codes **MUST** be extracted from red/blue text in tables. If multiple colors exist:  
+  `RED > BLUE > DEFAULT TEXT`  
+- **Top-section fields:** `quotation_number`/`quotation_date` **ONLY** from:  
+  - Document header OR  
+  - Top row of items table (ignore footer/other sections)  
+- **Fixed-table fields:** `purchasing_group`, `plant`, `lead_time`, `submitted_by` **ONLY** from:  
+  - A SINGLE table (ignore all other text)  
+  - Format: `plant` = `"TG 4318 PL01"` (keep spaces/codes), `lead_time` = `"7 days"` (preserve "days")  
+
+**Line Items Protocol (per table row):**  
+| Field             | Extraction Rule                                  |  
+|-------------------|------------------------------------------------|  
+| `item_number`     | Omit if column missing; else: `""` if unreadable, `-` if empty |  
+| `material_code`   | **RED/BLUE TEXT ONLY** in material column (ignore default text) |  
+| `quantity`        | Raw value from quantity column (e.g., `"100 EA"` if column merged) |  
+| `unit`            | Omit if column missing; else: `""` if unreadable |  
+| `unit_price`      | **NEVER calculate** - extract raw value from unit price column |  
+| `amount`          | Raw value from amount column (e.g., `"1,500,000.00"`) |  
+| `UoM`             | From unit column (e.g., `"EA"`, `"KG"`) |  
+
+**FINAL OUTPUT EXAMPLE (VALID ONLY IF DATA EXISTS):**  
+```json  
+{{  
+  "quotation_number": "QTN-2026-789",  
+  "quotation_date": "2026-04-29",  
+  "sales_agent": "Person name",  
+  "no_telp": "+62 812-3456-7890",  
+  "currency": "IDR",  
+  "purchasing_group": "P03",  
+  "plant": "PL01",  
+  "lead_time": "7 days",  
+  "submitted_by": "Person name",  
+  "material_items": [  
+    {{  
+      "material_code": "MAT-RED-001",  
+      "material_description": "Stainless Steel Pipe",  
+      "quantity": "100",  
+      "unit": "EA",  
+      "unit_price": "15,000.00",  
+      "amount": "1,500,000.00",  
+      "UoM": "EA"  
+    }}  
+  ]  
+}}  
+
 """
 
 SIM_PROMPT = f"""

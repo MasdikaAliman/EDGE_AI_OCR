@@ -18,17 +18,10 @@ from typing import Any, Dict, List, Literal, Optional, Union
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-
-
 DocumentType = Literal["General", "KTP", "KK", "NPWP", "Invoice", "Quotation", "SIM", "STNK", "Passport"]
 
 MAX_IMAGES = 5
 ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff"}
-
-
-
-
 
 class ImageUrl(BaseModel):
     """Base64 data URI wrapper.  External http/https URLs are rejected."""
@@ -51,7 +44,8 @@ class TextContent(BaseModel):
 class ImageContent(BaseModel):
     """Image message item using OpenAI-compatible image_url structure."""
     type: Literal["image_url"]
-    image_url: ImageUrl
+    image_url: ImageUrl = Field(..., description="The image URL wrapper containing the base64 data URI.")
+
 
 
 class OCRJsonRequest(BaseModel):
@@ -265,13 +259,11 @@ async def _run_ocr(
         raw_content = [{"type": "text", "text": default_prompt}] + raw_content
 
     clean_content = _sanitize_content(raw_content)
-
     system_prompt = get_prompt(document_type, fields)
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=clean_content),
     ]
-
     try:
         response = model.invoke(messages)
         extracted_data = json.loads(_clean_json_response(response.content))
@@ -424,11 +416,11 @@ async def process_ocr_upload(
         default="General",
         description="Document type. Options: " + ", ".join(DOCUMENT_PROMPTS.keys()),
     ),
-    fields: Optional[str] = Form(
+    fields: Optional[List[str]] = Form(
         default=None,
         description=(
-            "Optional JSON array of snake_case field names to extract. "
-            'Example: ["invoice_number","total","buyer_name"]'
+            "Optional list of snake_case field names to extract. "
+            "Add each field name as a separate 'fields' parameter."
         ),
     ),
     custom_prompt: Optional[str] = Form(
@@ -445,37 +437,21 @@ async def process_ocr_upload(
     Send a `multipart/form-data` POST with:
     - `files`: one or more image files
     - `document_type`: e.g. `KTP` (default: `General`)
-    - `fields` *(optional)*: JSON array string, e.g. `["full_name","nik"]`
+    - `fields` *(optional)*: List of field names, e.g., pass multiple `-F "fields=name,nik"`
     - `custom_prompt` *(optional)*: override the default user instruction
 
     ```bash
-    curl -X POST http://localhost:5030/ocr/process/upload \\
-      -F "files=@id_card.jpg" \\
-      -F "document_type=KTP" \\
-      -F 'fields=["full_name","nik","birth_date"]'
+    curl -X 'POST' \
+        'http://localhost:5030/ocr/process/upload' \
+        -H 'accept: application/json' \
+        -H 'Content-Type: multipart/form-data' \
+        -F 'files=@ktp_2.png;type=image/png' \
+        -F 'document_type=KTP' \
+        -F 'fields=name,nik' \
+        -F 'custom_prompt=string'
     ```
     """
-    # ── Parse optional `fields` form value (comes in as a raw JSON string) ─────
-    parsed_fields: Optional[List[str]] = None
-    if fields:
-        try:
-            parsed_fields = json.loads(fields)
-            if not isinstance(parsed_fields, list) or not all(
-                isinstance(f, str) for f in parsed_fields
-            ):
-                raise ValueError("fields must be a JSON array of strings.")
-        except (json.JSONDecodeError, ValueError) as e:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "success": False,
-                    "error_type": "invalid_fields_format",
-                    "message": (
-                        f"'fields' must be a valid JSON array of strings. Error: {e}. "
-                        'Example: ["invoice_number","total"]'
-                    ),
-                },
-            )
+    parsed_fields = fields
 
     # ── Build content list from uploaded files ─────────────────────────────────
     raw_content: List[Dict[str, Any]] = []

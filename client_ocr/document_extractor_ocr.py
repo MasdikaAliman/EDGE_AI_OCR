@@ -134,58 +134,50 @@ def preprocess_image(image) -> np.ndarray:
 #  QWEN OCR CLIENT
 # ─────────────────────────────────────────────
 
-def image_to_base64(image_input) -> str:
+def image_to_bytes(image_input) -> bytes:
     if isinstance(image_input, str):
         with open(image_input, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
+            return f.read()
     if isinstance(image_input, np.ndarray):
-        _, buf = cv2.imencode(".jpg", image_input)
-        return base64.b64encode(buf).decode("utf-8")
+        # Use PNG for lossless compression to preserve text edges
+        _, buf = cv2.imencode(".png", image_input)
+        return buf.tobytes()
     if isinstance(image_input, Image.Image):
         buf = io.BytesIO()
-        image_input.save(buf, format="JPEG")
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
+        # Save as PNG instead of JPEG to prevent text artifacts
+        image_input.save(buf, format="PNG")
+        return buf.getvalue()
     raise TypeError(f"Unsupported image type: {type(image_input)}")
 
 
 def call_qwen_api(
     api_url: str,
-    image_b64,
+    image_bytes,
     prompt: str,
     document_type: str = "General",
     fields: list = None,
     timeout: int = 60
 ) -> dict:
-    """Send one or more base64 images to the Qwen OCR API.
-    
-    Payload format matches the server's MessageContent Pydantic model:
-      {
-        "document_type": "Invoice",
-        "fields": ["invoice_number", "total"],  # optional
-        "content": [
-          {"type": "text", "text": "..."},
-          {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
-        ]
-      }
-    """
-    images = [image_b64] if isinstance(image_b64, str) else list(image_b64)
+    """Send one or more images to the Qwen OCR API using multipart/form-data."""
+    images = [image_bytes] if isinstance(image_bytes, bytes) else list(image_bytes)
 
-    content = [{"type": "text", "text": prompt}]
-    for b64 in images:
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
-        })
+    if not api_url.endswith("/upload"):
+        api_url = api_url.rstrip("/") + "/upload"
 
-    payload = {
+    files = []
+    for i, img_b in enumerate(images):
+
+        files.append(("files", (f"image_{i}.png", img_b, "image/png")))
+
+    data = {
         "document_type": document_type,
-        "content": content
+        "custom_prompt": prompt
     }
     if fields:
-        payload["fields"] = fields
+        data["fields"] = fields
 
     try:
-        resp = requests.post(api_url, json=payload, timeout=timeout)
+        resp = requests.post(api_url, files=files, data=data, timeout=timeout)
         resp.raise_for_status()
         result = resp.json()
 
@@ -267,9 +259,9 @@ class DocumentExtractor:
         if img is None:
             raise ValueError(f"Cannot read image: {image_path}")
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        b64     = image_to_base64(img_rgb)
+        img_bytes = image_to_bytes(img_rgb)
         raw     = call_qwen_api(
-            self.api_url, b64, self.prompt,
+            self.api_url, img_bytes, self.prompt,
             document_type=self.document_type,
             fields=self.fields
         )
@@ -286,35 +278,34 @@ class DocumentExtractor:
             print(f"  → PDF has {total_pages} page(s). Scanning: "
                   f"{[i + 1 for i in page_indices]}")
 
-            page_images_b64 = []
+            page_images_bytes = []
             combined_text = ""
 
             for page_num in page_indices:
                 page = pdf.pages[page_num]
                 text = page.extract_text() or ""
-                print(len(text.strip()))
-                if len(text.strip()) > 1200:
+                if len(text.strip()) > 1500:
                     print(f"  → Page {page_num + 1}: text-rich")
                     combined_text += f"\n--- Page {page_num + 1} ---\n{text}"
                 else:
                     print(f"  → Page {page_num + 1}: image-based, rasterising…")
-                    try:
-                        pil_img = page.to_image(resolution=self.dpi_pdf).original
-                        prepro_img = preprocess_image(pil_img)
-                        page_images_b64.append(image_to_base64(prepro_img))
-                    except Exception as e:
-                        print(f"Rasterise error page {page_num + 1}: {e}")
+                try:
+                    pil_img = page.to_image(resolution=self.dpi_pdf).original
+                    prepro_img = preprocess_image(pil_img)
+                    page_images_bytes.append(image_to_bytes(prepro_img))
+                except Exception as e:
+                    print(f"Rasterise error page {page_num + 1}: {e}")
 
             # Single API call with all images
-            if page_images_b64:
+            if page_images_bytes:
                 prompt = self.prompt
                 if combined_text:
                     prompt += f"\n\nADDITIONAL TEXT FROM DOCUMENT:\n{combined_text}"
-                print(f"  → Sending {len(page_images_b64)} image(s) to API…")
+                print(f"  → Sending {len(page_images_bytes)} image(s) to API…")
                 try:
                     raw = call_qwen_api(
                         self.api_url,
-                        page_images_b64,
+                        page_images_bytes,
                         prompt,
                         document_type=self.document_type,
                         fields=self.fields
@@ -460,7 +451,7 @@ class DocumentExtractor:
 
 if __name__ == "__main__":
 
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
+    config_path = sys.argv[1] if len(sys.argv) > 1 else "client_ocr/config.yaml"
 
     print("=" * 60)
     print("  DOCUMENT EXTRACTION TOOL  (Qwen Vision API)")
