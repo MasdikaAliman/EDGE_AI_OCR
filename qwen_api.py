@@ -23,71 +23,6 @@ DocumentType = Literal["General", "KTP", "KK", "NPWP", "Invoice", "Quotation", "
 MAX_IMAGES = 5
 ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff"}
 
-class ImageUrl(BaseModel):
-    """Base64 data URI wrapper.  External http/https URLs are rejected."""
-    url: str = Field(
-        ...,
-        description=(
-            "Base64-encoded image URI: 'data:image/<mime>;base64,<data>'. "
-            "External http/https URLs are NOT accepted."
-        ),
-        examples=["data:image/jpeg;base64,/9j/4AAQ..."],
-    )
-
-
-class TextContent(BaseModel):
-    """Plain-text message item."""
-    type: Literal["text"]
-    text: str = Field(..., examples=["Extract all fields from this invoice"])
-
-
-class ImageContent(BaseModel):
-    """Image message item using OpenAI-compatible image_url structure."""
-    type: Literal["image_url"]
-    image_url: ImageUrl = Field(..., description="The image URL wrapper containing the base64 data URI.")
-
-
-
-class OCRJsonRequest(BaseModel):
-    """
-    Request body for **JSON** mode of `POST /ocr/process`.
-
-    - **document_type**: Picks the specialized extraction prompt.
-      Choices: General, KTP, KK, NPWP, Invoice, Quotation, SIM, STNK, Passport.
-    - **fields** *(optional)*: If supplied, the model extracts **only** these
-      snake_case field names and ignores document-type defaults.
-    - **content**: Ordered list of text/image items.
-      Must contain at least one `image_url`. Max {MAX_IMAGES} images.
-    """
-
-    document_type: DocumentType = Field(
-        default="General",
-        description="Document type — selects the matching extraction prompt.",
-        examples=["Invoice"],
-    )
-    fields: Optional[List[str]] = Field(
-        default=None,
-        description=(
-            "Optional list of snake_case field names to extract. "
-            "When omitted, the default fields for the chosen document_type are used."
-        ),
-        examples=[["invoice_number", "total", "buyer_name"]],
-    )
-    content: List[Union[TextContent, ImageContent]] = Field(
-        ...,
-        description=(
-            f"Ordered content items. At least one image_url required. "
-            f"Max {MAX_IMAGES} image_url items. "
-            "Optionally prepend a text item with a custom instruction."
-        ),
-        examples=[
-            [
-                {"type": "text", "text": "Extract all fields"},
-                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/..."}},
-            ]
-        ],
-    )
-
 
 app = FastAPI(
     title="Document OCR API",
@@ -265,7 +200,7 @@ async def _run_ocr(
         HumanMessage(content=clean_content),
     ]
     try:
-        response = model.invoke(messages)
+        response = model.invoke(messages, timeout=120)
         extracted_data = json.loads(_clean_json_response(response.content))
         return {"success": True, "data": extracted_data}
 
@@ -369,36 +304,6 @@ def _extract_inner_message(error_str: str) -> str:
     return error_str
 
 
-
-@app.post(
-    "/ocr/process",
-    summary="Extract document fields (JSON body — base64 images)",
-    tags=["OCR"],
-)
-async def process_ocr_json(req: OCRJsonRequest):
-    """
-    **JSON mode** — send images as base64 data URIs inside the `content` array.
-
-    ```json
-    {
-      "document_type": "Invoice",
-      "fields": ["invoice_number", "total"],   // optional
-      "content": [
-        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
-      ]
-    }
-    ```
-    """
-    try:
-        raw_content = [item.model_dump() for item in req.content]
-        return await _run_ocr(req.document_type, raw_content, req.fields)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Unexpected error: %s", e)
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
-
-
 @app.post(
     "/ocr/process/upload",
     summary="Extract document fields (multipart — file upload)",
@@ -417,14 +322,15 @@ async def process_ocr_upload(
         description="Document type. Options: " + ", ".join(DOCUMENT_PROMPTS.keys()),
     ),
     fields: Optional[List[str]] = Form(
-        default=None,
+        default=[],
         description=(
             "Optional list of snake_case field names to extract. "
             "Add each field name as a separate 'fields' parameter."
         ),
+        example=None
     ),
     custom_prompt: Optional[str] = Form(
-        default=None,
+        default="",
         description=(
             "Optional custom instruction prepended to the model input. "
             "If omitted, the default instruction for the document_type is used."
