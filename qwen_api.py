@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 from PIL import Image
-
+import pdfplumber
 
 from prompts import DEFAULT_USER_PROMPTS, DOCUMENT_PROMPTS, get_prompt
 from pydantic import BaseModel, Field
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 DocumentType = Literal["General", "KTP", "KK", "NPWP", "Invoice", "Quotation", "SIM", "STNK", "Passport"]
 
 MAX_IMAGES = 5
-ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff"}
+ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff", "application/pdf"}
 
 
 app = FastAPI(
@@ -63,6 +63,36 @@ def _preprocess_image(b64_data: str, max_size: int = 1024) -> str:
 
     img.close()
     return result
+
+
+def _pdf_to_images(pdf_bytes: bytes, max_pages: int = MAX_IMAGES) -> List[Dict[str, Any]]:
+    """Convert a PDF file into a list of image_url content items."""
+    items = []
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for i, page in enumerate(pdf.pages):
+                if i >= max_pages:
+                    break
+                
+                # Render page to image at 150 DPI
+                im = page.to_image(resolution=150).original
+                
+                with io.BytesIO() as out:
+                    if im.mode in ("RGBA", "P"):
+                        im = im.convert("RGB")
+                    im.save(out, format="PNG", quality=95)
+                    b64 = base64.b64encode(out.getvalue()).decode("utf-8")
+                
+                cleaned = _preprocess_image(b64)
+                items.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{cleaned}"},
+                })
+    except Exception as e:
+        logger.error("Error processing PDF: %s", e)
+        raise ValueError(f"Failed to process PDF: {str(e)}")
+        
+    return items
 
 
 def _file_to_content_item(raw_bytes: bytes, content_type: str) -> Dict[str, Any]:
@@ -313,8 +343,8 @@ async def process_ocr_upload(
     files: List[UploadFile] = File(
         ...,
         description=(
-            f"One or more image files to process (max {MAX_IMAGES}). "
-            "Accepted formats: JPEG, PNG, WebP, GIF, TIFF."
+            f"One or more image/PDF files to process (max {MAX_IMAGES} pages/images). "
+            "Accepted formats: JPEG, PNG, WebP, GIF, TIFF, PDF."
         ),
     ),
     document_type: DocumentType = Form(
@@ -380,7 +410,16 @@ async def process_ocr_upload(
             )
 
         try:
-            raw_content.append(_file_to_content_item(raw_bytes, content_type))
+            mime = content_type.split(";")[0].strip().lower()
+            if mime == "application/pdf":
+                current_image_count = sum(1 for item in raw_content if item.get("type") == "image_url")
+                remaining_slots = MAX_IMAGES - current_image_count
+                
+                if remaining_slots > 0:
+                    pdf_items = _pdf_to_images(raw_bytes, max_pages=remaining_slots)
+                    raw_content.extend(pdf_items)
+            else:
+                raw_content.append(_file_to_content_item(raw_bytes, content_type))
         except HTTPException:
             raise
         except Exception as e:
