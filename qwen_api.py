@@ -13,7 +13,8 @@ import pdfplumber
 
 from prompts import DEFAULT_USER_PROMPTS, DOCUMENT_PROMPTS, get_prompt
 from pydantic import BaseModel, Field
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union, TypedDict
+from langgraph.graph import StateGraph, START, END
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,10 +30,11 @@ app = FastAPI(
     description=(
         "High-precision document OCR powered by Qwen3-VL via vLLM.\n\n"
         "Accepts images as **base64 JSON** or **multipart file uploads**.\n\n"
+        "Features a **LangGraph-powered pipeline** for multi-page documents and PDFs.\n\n"
         "Supported document types: "
         + ", ".join(DOCUMENT_PROMPTS.keys())
     ),
-    version="3.0.0",
+    version="3.1.0",
 )
 
 BASE_URL_LLM = "http://192.168.13.176:8053"
@@ -71,11 +73,11 @@ def _pdf_to_images(pdf_bytes: bytes, max_pages: int = MAX_IMAGES) -> List[Dict[s
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for i, page in enumerate(pdf.pages):
-                if i >= max_pages:
-                    break
+                # if i >= max_pages:
+                #     break
                 
                 # Render page to image at 150 DPI
-                im = page.to_image(resolution=150).original
+                im = page.to_image(resolution=500).original
                 
                 with io.BytesIO() as out:
                     if im.mode in ("RGBA", "P"):
@@ -248,6 +250,142 @@ async def _run_ocr(
 
     except Exception as e:
         _handle_llm_exception(e)
+
+
+# ── LangGraph Pipeline for Multi-Page ──────────────────────────────────────
+
+class OCRState(TypedDict):
+    document_type: str
+    fields: Optional[List[str]]
+    custom_prompt: Optional[str]
+    images: List[Dict[str, Any]]
+    current_idx: int
+    page_results: List[Dict[str, Any]]
+    final_result: Dict[str, Any]
+
+def process_page_node(state: OCRState) -> Dict[str, Any]:
+    idx = state["current_idx"]
+    image_item = state["images"][idx]
+    
+    doc_type = state["document_type"]
+    fields = state["fields"]
+    custom_prompt = state["custom_prompt"]
+    
+    raw_content = [image_item]
+    if custom_prompt:
+        raw_content.insert(0, {"type": "text", "text": custom_prompt})
+    else:
+        default_prompt = DEFAULT_USER_PROMPTS.get(doc_type, DEFAULT_USER_PROMPTS["General"])
+        raw_content.insert(0, {"type": "text", "text": default_prompt})
+        
+    system_prompt = get_prompt(doc_type, fields)
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=raw_content),
+    ]
+    
+    try:
+        response = model.invoke(messages)
+        extracted_data = json.loads(_clean_json_response(response.content))
+        print(f"\n=== DEBUG: Page {idx} Extracted Data ===\n{response.content}")
+    except Exception as e:
+        logger.error("Error extracting page %d: %s", idx, e)
+        extracted_data = {"error": str(e), "page": idx}
+        
+    return {
+        "page_results": state.get("page_results", []) + [extracted_data],
+        "current_idx": idx + 1
+    }
+
+def check_more_pages(state: OCRState) -> Literal["process_page", "aggregate_results"]:
+    if state["current_idx"] < len(state["images"]):
+        return "process_page"
+    return "aggregate_results"
+
+def aggregate_node(state: OCRState) -> Dict[str, Any]:
+    page_results = state.get("page_results", [])
+    doc_type = state["document_type"]
+    
+    if not page_results:
+        return {"final_result": {}}
+        
+    system_prompt = (
+    f"""You are an expert data arbitration engine for {doc_type} documents.
+Multiple pages were OCR'd independently. Produce ONE final JSON object.
+RULES:
+- For each field, choose the most complete and credible value across all pages.
+- If the same field appears on multiple pages with DIFFERENT values, prefer:
+    1. The value that is more complete (not empty/partial).
+    2. The value from the page where that field would naturally appear
+       (e.g. totals from the last page, header info from the first page).
+- For array fields (e.g. line items, members), MERGE arrays from all pages
+  and deduplicate identical rows.
+- If a field is empty ("") or null on ALL pages, output "" for that field.
+- NEVER fabricate or infer values not present in any page result.
+- Return ONLY a raw JSON object. No markdown, no commentary, no code fences.
+"""
+    )
+    
+    user_content = json.dumps(page_results, indent=2)
+    print("\n=== DEBUG: Aggregation User Content ===\n", user_content)
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_content),
+    ]
+    
+    try:
+        response = model.invoke(messages)
+        final_data = json.loads(_clean_json_response(response.content))
+        print("""\n=== DEBUG: Aggregation Node ===\n""", response.content)
+    except Exception as e:
+        logger.error("Error in aggregation node: %s", e)
+        final_data = {"error": f"Aggregation failed: {str(e)}", "partial_results": page_results}
+        
+    return {"final_result": final_data}
+
+async def _run_langgraph_ocr(
+    document_type: str,
+    images: List[Dict[str, Any]],
+    fields: Optional[List[str]] = None,
+    custom_prompt: str = ""
+) -> dict:
+    workflow = StateGraph(OCRState)
+    
+    workflow.add_node("process_page", process_page_node)
+    workflow.add_node("aggregate_results", aggregate_node)
+    
+    workflow.add_edge(START, "process_page")
+    workflow.add_conditional_edges(
+        "process_page",
+        check_more_pages,
+        {
+            "process_page": "process_page",
+            "aggregate_results": "aggregate_results"
+        }
+    )
+    workflow.add_edge("aggregate_results", END)
+    
+    app_graph = workflow.compile()
+    
+    initial_state = {
+        "document_type": document_type,
+        "fields": fields,
+        "custom_prompt": custom_prompt,
+        "images": images,
+        "current_idx": 0,
+        "page_results": [],
+        "final_result": {}
+    }
+    
+    try:
+        final_state = await app_graph.ainvoke(initial_state)
+        return {"success": True, "data": final_state.get("final_result", {})}
+    except Exception as e:
+        logger.error("LangGraph processing error: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail={"success": False, "error_type": "graph_error", "message": str(e)}
+        )
 
 
 def _handle_llm_exception(exc: Exception) -> None:
@@ -433,7 +571,21 @@ async def process_ocr_upload(
             )
 
     try:
-        return await _run_ocr(document_type, raw_content, parsed_fields)
+        # Separate images and sanitize
+        images = [item for item in raw_content if item.get("type") == "image_url"]
+        images = _sanitize_content(images)
+        
+        # Extract custom prompt text if present
+        prompt_text = ""
+        for item in raw_content:
+            if item.get("type") == "text":
+                prompt_text = item.get("text", "")
+                break
+                
+        if len(images) > 1:
+            return await _run_langgraph_ocr(document_type, images, parsed_fields, prompt_text)
+        else:
+            return await _run_ocr(document_type, raw_content, parsed_fields)
     except HTTPException:
         raise
     except Exception as e:
@@ -470,7 +622,7 @@ async def health_check():
 async def root():
     return {
         "name": "Document OCR API",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "supported_document_types": list(DOCUMENT_PROMPTS.keys()),
         "endpoints": {
             "json_ocr":    "POST /ocr/process",

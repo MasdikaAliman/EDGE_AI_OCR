@@ -1,0 +1,26 @@
+user_prompt=<<<
+You are a strict JSON extraction engine.
+Your ONLY task is to return ONE valid JSON object.
+Do NOT return an array at the top level.
+
+OUTPUT FORMAT (MANDATORY):
+{
+  "date": "",
+  "quotation_no": "",
+  "sales_agent": "",
+  "no_telp": "",
+  "currency": "",
+  "purchasing_group": "",
+  "plant": "",
+  "lead_time": "",
+  "submitted_by": "",
+  "material_code": "",
+  "material_descriptions": "",
+  "UoM": "",
+  "quantity": "",
+  "unit_price": ""
+}
+
+
+Return ONLY the JSON object.
+>>>

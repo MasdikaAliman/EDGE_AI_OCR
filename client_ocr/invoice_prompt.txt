@@ -1,0 +1,14 @@
+user_prompt=<<<
+You are a strict JSON extraction engine.
+
+Your ONLY task is to return a valid JSON object.
+
+OUTPUT FORMAT (MANDATORY):
+{
+  "invoice_number": "",
+  "invoice_date": "",
+  "total_amount": "",
+  "sales_order": "",
+  "remark": ""
+}
+>>>

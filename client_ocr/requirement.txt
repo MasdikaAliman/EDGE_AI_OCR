@@ -1,0 +1,9 @@
+pdfplumber
+pandas
+opencv-python
+numpy
+requests
+PyYAML
+Pillow
+openpyxl
+pyinstaller
