@@ -1,466 +1,893 @@
-"""
-Comprehensive test suite for Qwen OCR API.
-Tests all possible input scenarios: success cases, validation errors, and edge cases.
-
-Usage:
-    1. Start your API server:  python qwen_api.py
-    2. Run tests:              python test_qwen_api.py
-"""
-import requests
 import base64
-import os
+import io
 import json
+import logging
+import re
+import requests
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import HumanMessage, SystemMessage
+from PIL import Image
+import pdfplumber
 
-API_URL = "http://localhost:5030/ocr/process"
-API_UPLOAD_URL = "http://localhost:5030/ocr/process/upload"
-API_HEALTH = "http://localhost:5030/health"
-API_ROOT = "http://localhost:5030/"
+from prompts import DEFAULT_USER_PROMPTS, DOCUMENT_PROMPTS, get_prompt
+from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Literal, Optional, Union, TypedDict
+from langgraph.graph import StateGraph, START, END
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def create_dummy_image_bytes(format="JPEG"):
-    from PIL import Image as PILImage
-    import io as _io
-    buf = _io.BytesIO()
-    PILImage.new("RGB", (10, 10), "white").save(buf, format=format)
-    return buf.getvalue()
+DocumentType = Literal["General", "KTP", "KK", "NPWP", "Invoice", "Quotation", "SIM", "STNK", "Passport"]
 
-def encode_image(path: str) -> str:
-    """Read an image file and return its base64-encoded string."""
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+MAX_IMAGES = 5
+ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff", "application/pdf"}
 
 
-def print_result(response):
-    """Pretty-print the API response."""
-    print(f"  Status Code : {response.status_code}")
+app = FastAPI(
+    title="Document OCR API",
+    description=(
+        "High-precision document OCR powered by Qwen3-VL via vLLM.\n\n"
+        "Accepts images as **base64 JSON** or **multipart file uploads**.\n\n"
+        "Features a **LangGraph-powered pipeline** for multi-page documents and PDFs.\n\n"
+        "Supported document types: "
+        + ", ".join(DOCUMENT_PROMPTS.keys())
+    ),
+    version="3.1.0",
+)
+
+BASE_URL_LLM = "http://192.168.13.176:8053"
+
+model = init_chat_model(
+    model="qwen3-vl",
+    model_provider="openai",
+    base_url=BASE_URL_LLM + "/v1",
+    api_key="EMPTY",
+    temperature=0.0,
+)
+
+
+def _preprocess_image(b64_data: str, max_size: int = 1024) -> str:
+    """Decode → resize if needed → re-encode as JPEG base64."""
+    raw_bytes = base64.b64decode(b64_data)
+    with io.BytesIO(raw_bytes) as src:
+        img = Image.open(src)
+        img.load()
+
+    img = img.convert("RGB")
+    if max(img.size) > max_size:
+        img.thumbnail((max_size, max_size), Image.LANCZOS)
+
+    with io.BytesIO() as out:
+        img.save(out, format="JPEG", quality=95)
+        result = base64.b64encode(out.getvalue()).decode("utf-8")
+
+    img.close()
+    return result
+
+
+def _pdf_to_images(pdf_bytes: bytes, max_pages: int = MAX_IMAGES) -> List[Dict[str, Any]]:
+    """Convert a PDF file into a list of image_url content items."""
+    items = []
     try:
-        body = response.json()
-        print(f"  Response    : {json.dumps(body, indent=2, ensure_ascii=False)[:500]}")
-    except Exception:
-        print(f"  Raw Body    : {response.text[:500]}")
-
-
-def run_test(name: str, func):
-    """Run a single test with header and separator."""
-    print(f"\n{'='*60}")
-    print(f"  {name}")
-    print(f"{'='*60}")
-    try:
-        func()
-    except Exception as e:
-        print(f"  TEST RUNNER ERROR: {e}")
-
-
-# ---------------------------------------------------------------------------
-# SUCCESS CASES (require vLLM to be running for 200; otherwise expect 502/503)
-# ---------------------------------------------------------------------------
-
-def test_01_general_base64():
-    """Test 1: General OCR with IJAZAH.jpg via JSON base64"""
-    img_path = "IJAZAH.jpg"
-    if not os.path.exists(img_path):
-        print(f"  SKIP: {img_path} not found"); return
-
-    payload = {
-        "document_type": "General",
-        "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image(img_path)}"}}
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-
-
-def test_02_ktp_base64_no_prompt():
-    """Test 2: KTP OCR with ktp_1.png, NO text prompt (auto-inject default)"""
-    img_path = os.path.join("KTP", "ktp_1.png")
-    if not os.path.exists(img_path):
-        print(f"  SKIP: {img_path} not found"); return
-
-    payload = {
-        "document_type": "KTP",
-        "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encode_image(img_path)}"}}
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-
-
-def test_03_invoice_base64_with_prompt():
-    """Test 3: Invoice OCR with invoice_example.PNG + custom prompt"""
-    img_path = "invoice_example.PNG"
-    if not os.path.exists(img_path):
-        print(f"  SKIP: {img_path} not found"); return
-
-    payload = {
-        "document_type": "Invoice",
-        "content": [
-            {"type": "text", "text": "Extract all line items and totals from this invoice"},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encode_image(img_path)}"}}
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-
-
-def test_04_npwp_base64():
-    """Test 4: NPWP OCR with NPWP.png"""
-    img_path = os.path.join("npwp", "NPWP.png")
-    if not os.path.exists(img_path):
-        print(f"  SKIP: {img_path} not found"); return
-
-    payload = {
-        "document_type": "NPWP",
-        "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encode_image(img_path)}"}}
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-
-def test_05_kk_base64():
-    """Test 5: KK (Kartu Keluarga) OCR"""
-    img_path = os.path.join("KK", "kk_1.png")
-    if not os.path.exists(img_path):
-        b64 = base64.b64encode(create_dummy_image_bytes()).decode("utf-8")
-        print(f"  NOTE: {img_path} not found, using a dummy image to test routing.")
-    else:
-        b64 = encode_image(img_path)
-
-    payload = {
-        "document_type": "KK",
-        "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-
-def test_06_sim_base64():
-    """Test 6: SIM OCR"""
-    img_path = os.path.join("SIM", "sim_1.png")
-    if not os.path.exists(img_path):
-        from PIL import Image as PILImage
-        import io as _io
-        buf = _io.BytesIO()
-        PILImage.new("RGB", (10, 10), "white").save(buf, format="JPEG")
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        print(f"  NOTE: {img_path} not found, using a dummy image to test routing.")
-    else:
-        b64 = encode_image(img_path)
-
-    payload = {
-        "document_type": "SIM",
-        "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-
-def test_07_quotation_base64():
-    """Test 7: Quotation OCR"""
-    img_path = "quotation_example.PNG"
-    if not os.path.exists(img_path):
-        from PIL import Image as PILImage
-        import io as _io
-        buf = _io.BytesIO()
-        PILImage.new("RGB", (10, 10), "white").save(buf, format="JPEG")
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        print(f"  NOTE: {img_path} not found, using a dummy image to test routing.")
-    else:
-        b64 = encode_image(img_path)
-
-    payload = {
-        "document_type": "Quotation",
-        "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-
-def test_07b_stnk_base64():
-    """Test 7b: STNK OCR"""
-    b64 = base64.b64encode(create_dummy_image_bytes()).decode("utf-8")
-    payload = {
-        "document_type": "STNK",
-        "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-
-def test_07c_passport_base64():
-    """Test 7c: Passport OCR"""
-    b64 = base64.b64encode(create_dummy_image_bytes()).decode("utf-8")
-    payload = {
-        "document_type": "Passport",
-        "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-
-def test_08_fields_extraction():
-    """Test 8: Custom Fields Extraction"""
-    img_path = os.path.join("KTP", "ktp_1.png")
-    if not os.path.exists(img_path):
-        from PIL import Image as PILImage
-        import io as _io
-        buf = _io.BytesIO()
-        PILImage.new("RGB", (10, 10), "white").save(buf, format="JPEG")
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        print(f"  NOTE: {img_path} not found, using a dummy image to test routing.")
-    else:
-        b64 = encode_image(img_path)
-
-    payload = {
-        "document_type": "KTP",
-        "fields": ["nik", "nama", "tanggal_lahir"],
-        "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-
-
-# ---------------------------------------------------------------------------
-# ERROR / VALIDATION CASES (these should NOT reach vLLM)
-# ---------------------------------------------------------------------------
-
-def test_09_url_rejected():
-    """Test 9: External URL should be REJECTED with 400"""
-    payload = {
-        "document_type": "General",
-        "content": [
-            {"type": "image_url", "image_url": {"url": "https://upload.wikimedia.org/wikipedia/commons/a/a7/React-icon.svg"}}
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-    assert r.status_code == 400, f"Expected 400, got {r.status_code}"
-    print("  PASS: URL correctly rejected")
-
-
-def test_10_image_limit_exceeded():
-    """Test 10: Sending 6 images should be REJECTED with 400 (max is 5)"""
-    # Create a tiny valid base64 image
-    tiny_b64 = base64.b64encode(create_dummy_image_bytes()).decode("utf-8")
-
-    payload = {
-        "document_type": "General",
-        "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{tiny_b64}"}}
-            for _ in range(6)  # 6 images = over the limit
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-    assert r.status_code == 400, f"Expected 400, got {r.status_code}"
-    assert "image_limit_exceeded" in r.text
-    print("  PASS: 6-image limit correctly enforced")
-
-
-def test_11_empty_content():
-    """Test 11: Empty content list should fail Pydantic validation (422)"""
-    payload = {
-        "document_type": "General",
-        "content": []
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-    # FastAPI/Pydantic may return 422 for validation or the server may handle differently
-    assert r.status_code in (400, 422), f"Expected 400 or 422, got {r.status_code}"
-    print("  PASS: Empty content correctly rejected")
-
-
-def test_12_invalid_document_type():
-    """Test 12: Invalid document_type 'UnknownType' should fail Pydantic validation (422)"""
-    tiny_b64 = base64.b64encode(create_dummy_image_bytes()).decode("utf-8")
-
-    payload = {
-        "document_type": "UnknownType",
-        "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{tiny_b64}"}}
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-    assert r.status_code == 422, f"Expected 422, got {r.status_code}"
-    print("  PASS: Invalid document_type correctly rejected")
-
-
-def test_13_invalid_base64():
-    """Test 13: Corrupted base64 string should fail during preprocessing"""
-    payload = {
-        "document_type": "General",
-        "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,NOT_VALID_BASE64_!!!"}}
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-    assert r.status_code in (400, 500), f"Expected 400 or 500, got {r.status_code}"
-    print("  PASS: Invalid base64 correctly handled")
-
-
-def test_14_no_image_provided():
-    """Test 14: Text only (no image) should be REJECTED with 400"""
-    payload = {
-        "document_type": "General",
-        "content": [
-            {"type": "text", "text": "Extract fields"}
-        ]
-    }
-    r = requests.post(API_URL, json=payload)
-    print_result(r)
-    assert r.status_code == 400, f"Expected 400, got {r.status_code}"
-    print("  PASS: No image provided correctly handled")
-
-
-# ---------------------------------------------------------------------------
-# MULTIPART UPLOAD CASES
-# ---------------------------------------------------------------------------
-
-def test_15_upload_success():
-    """Test 15: Multipart upload success"""
-    files = [
-        ("files", ("NPWP.png", open(r"npwp\NPWP.png", "rb").read(), "image/png"))
-    ]
-    data = {"document_type": "NPWP"} 
-    r = requests.post(API_UPLOAD_URL, files=files, data=data)
-    print_result(r)
-
-def test_16_upload_with_fields():
-    """Test 16: Multipart upload with custom fields and prompt"""
-    files = [
-        ("files", ("ktp_1.png", open(r"KTP\ktp_1.png", "rb").read(), "image/png"))
-    ]
-    data = {
-        "document_type": "KTP",
-        "fields": ["nik", "nama"],
-        "custom_prompt": "Extract the NIK and Name clearly."
-    }
-    r = requests.post(API_UPLOAD_URL, files=files, data=data)
-    print_result(r)
-
-def test_16b_upload_multiple_images():
-    """Test 16b: Multipart upload with multiple images"""
-    files = [
-        ("files", ("NPWP.png", open(r"npwp\NPWP.png", "rb").read(), "image/png")),
-        ("files", ("ktp_1.png", open(r"KTP\ktp_1.png", "rb").read(), "image/png"))
-    ]
-    data = {
-        "document_type": "General",
-        "custom_prompt": "Extract all information from these documents."
-    }
-    r = requests.post(API_UPLOAD_URL, files=files, data=data)
-    print_result(r)
-
-def test_16c_upload_pdf():
-    """Test 16c: Multipart upload with PDF file (converted to image first)"""
-    import pdfplumber
-    import io
-    pdf_path = r"invoice_contoh\20260108-2026GI000000114.pdf"
-    if not os.path.exists(pdf_path):
-        print(f"  SKIP: {pdf_path} not found")
-        return
-
-    # Convert all pages of the PDF to images
-    files = []
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for i, page in enumerate(pdf.pages):
-                pil_img = page.to_image(resolution=300).original
-                buf = io.BytesIO()
-                pil_img.save(buf, format="PNG")
-                img_bytes = buf.getvalue()
-                files.append(("files", (f"invoice_page{i+1}.png", img_bytes, "image/png")))
+                # if i >= max_pages:
+                #     break
+                
+                # Render page to image at 150 DPI
+                im = page.to_image(resolution=500).original
+                
+                with io.BytesIO() as out:
+                    if im.mode in ("RGBA", "P"):
+                        im = im.convert("RGB")
+                    im.save(out, format="PNG", quality=95)
+                    b64 = base64.b64encode(out.getvalue()).decode("utf-8")
+                
+                cleaned = _preprocess_image(b64)
+                items.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{cleaned}"},
+                })
     except Exception as e:
-        print(f"  ERROR processing PDF: {e}")
-        return
+        logger.error("Error processing PDF: %s", e)
+        raise ValueError(f"Failed to process PDF: {str(e)}")
+        
+    return items
 
-    if not files:
-        print("  SKIP: No pages found in PDF")
-        return
-    data = {
-        "document_type": "Invoice",
-        "fields": ["invoice_number", "sales_order", "date", "total_amount"]
+
+def _camelot_tables_to_text(tables, page_num: int, flavor: str) -> List[str]:
+    """Convert a camelot TableList into readable text blocks."""
+    result = []
+    for table_idx, table in enumerate(tables, start=1):
+        df = table.df
+        if df.empty:
+            continue
+        # Use first row as header if it looks like one (no numeric-only values)
+        rows = []
+        for _, row in df.iterrows():
+            cleaned = [str(cell).strip() for cell in row]
+            rows.append(" | ".join(cleaned))
+        table_str = "\n".join(rows)
+        accuracy = getattr(table, "accuracy", None)
+        acc_note = f" (accuracy: {accuracy:.1f}%)" if accuracy is not None else ""
+        result.append(
+            f"[Page {page_num} - Table {table_idx} via {flavor}{acc_note}]\n{table_str}"
+        )
+    return result
+
+
+def _extract_tables_from_pdf(pdf_bytes: bytes) -> str:
+    """
+    Extract tables from all PDF pages using camelot-py.
+
+    Strategy:
+      1. Try 'lattice' mode first — best for tables with visible borders/grid lines.
+      2. Fall back to 'stream' mode for any pages where lattice found nothing
+         (handles whitespace-delimited tables without borders).
+      3. Fall back to pdfplumber if camelot is not installed or fails entirely.
+
+    Returns a formatted string of all tables found, ready to inject into the LLM prompt.
+    Returns empty string if no tables found.
+    """
+    import tempfile, os
+
+    table_texts = []
+
+    # Camelot requires a file path, not bytes — write to a temp file
+    tmp_path = None
+    try:
+        import camelot
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+
+        # ── Step 1: Lattice pass (all pages) ──────────────────────────────────
+        try:
+            lattice_tables = camelot.read_pdf(
+                tmp_path,
+                pages="all",
+                flavor="lattice",
+                suppress_stdout=True,
+            )
+            logger.info("Camelot lattice: found %d table(s)", len(lattice_tables))
+        except Exception as e:
+            logger.warning("Camelot lattice pass failed: %s", e)
+            lattice_tables = []
+
+        # Track which pages already have lattice results
+        pages_with_lattice: set = set()
+        for t in lattice_tables:
+            pages_with_lattice.add(t.page)
+            table_texts.extend(_camelot_tables_to_text([t], t.page, "lattice"))
+
+        # ── Step 2: Stream pass for pages without lattice results ──────────────
+        # Determine total page count from pdfplumber (lightweight)
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            total_pages = len(pdf.pages)
+
+        missing_pages = [
+            str(p) for p in range(1, total_pages + 1)
+            if p not in pages_with_lattice
+        ]
+
+        if missing_pages:
+            pages_str = ",".join(missing_pages)
+            try:
+                stream_tables = camelot.read_pdf(
+                    tmp_path,
+                    pages=pages_str,
+                    flavor="stream",
+                    suppress_stdout=True,
+                    edge_tol=50,    # tolerance for detecting row edges
+                    row_tol=10,     # tolerance for merging rows
+                )
+                logger.info(
+                    "Camelot stream: found %d table(s) on pages %s",
+                    len(stream_tables), pages_str,
+                )
+                for t in stream_tables:
+                    table_texts.extend(_camelot_tables_to_text([t], t.page, "stream"))
+            except Exception as e:
+                logger.warning("Camelot stream pass failed: %s", e)
+
+    except ImportError:
+        # ── Fallback: pdfplumber if camelot not installed ──────────────────────
+        logger.warning("camelot-py not installed — falling back to pdfplumber for table extraction")
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for page_num, page in enumerate(pdf.pages, start=1):
+                    tables = page.extract_tables()
+                    for table_idx, table in enumerate(tables or [], start=1):
+                        if not table:
+                            continue
+                        rows = [
+                            " | ".join(str(cell).strip() if cell else "" for cell in row)
+                            for row in table
+                        ]
+                        table_texts.append(
+                            f"[Page {page_num} - Table {table_idx} via pdfplumber]\n"
+                            + "\n".join(rows)
+                        )
+        except Exception as e:
+            logger.warning("pdfplumber fallback also failed: %s", e)
+
+    except Exception as e:
+        logger.warning("Could not extract tables from PDF: %s", e)
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    if not table_texts:
+        return ""
+
+    return (
+        "\n\n--- STRUCTURED TABLE DATA EXTRACTED FROM PDF ---\n"
+        + "\n\n".join(table_texts)
+        + "\n--- END TABLE DATA ---\n\n"
+        "Use the above table data to help fill in any fields that may be unclear from the image alone."
+    )
+
+
+def _file_to_content_item(raw_bytes: bytes, content_type: str) -> Dict[str, Any]:
+    """Convert raw image bytes into an OpenAI-compatible image_url content dict."""
+    mime = content_type.split(";")[0].strip().lower()
+    if mime not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "success": False,
+                "error_type": "unsupported_media_type",
+                "message": (
+                    f"File type '{mime}' is not supported. "
+                    f"Accepted types: {', '.join(sorted(ALLOWED_MIME_TYPES))}."
+                ),
+            },
+        )
+    b64 = base64.b64encode(raw_bytes).decode("utf-8")
+    cleaned = _preprocess_image(b64)
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:{mime};base64,{cleaned}"},
     }
-    r = requests.post(API_UPLOAD_URL, files=files, data=data)
-    print_result(r)
 
-def test_17_upload_unsupported_type():
-    """Test 17: Multipart upload with unsupported file type (415)"""
-    files = [
-        ("files", ("dummy.txt", b"Hello World", "text/plain"))
+
+def _sanitize_content(content: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sanitized = []
+    for item in content:
+        if item.get("type") == "image_url":
+            raw_url: str = item["image_url"]["url"]
+
+            if raw_url.startswith(("http://", "https://")):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "success": False,
+                        "error_type": "url_not_allowed",
+                        "message": (
+                            "External image URLs are not supported. "
+                            "Send images as base64 data URIs or upload via multipart/form-data."
+                        ),
+                    },
+                )
+
+            if ";base64," in raw_url:
+                prefix, b64_data = raw_url.split(";base64,", 1)
+                cleaned = _preprocess_image(b64_data)
+                item = {**item, "image_url": {"url": f"{prefix};base64,{cleaned}"}}
+
+        sanitized.append(item)
+    return sanitized
+
+
+def _clean_json_response(content: str) -> str:
+    """Strip markdown fences and extract the first JSON object/array."""
+    if "```json" in content:
+        content = content.split("```json")[1].split("```")[0].strip()
+    elif "```" in content:
+        content = content.split("```")[1].split("```")[0].strip()
+
+    content = content.strip()
+
+    # Advance to first JSON character
+    if "{" in content:
+        content = content[content.find("{"):]
+    elif "[" in content:
+        content = content[content.find("["):]
+
+    # Trim trailing garbage after closing bracket
+    if "}" in content:
+        content = content[: content.rfind("}") + 1]
+    elif "]" in content:
+        content = content[: content.rfind("]") + 1]
+
+    # Remove trailing commas before } or ]
+    content = re.sub(r",(\s*[}\]])", r"\1", content)
+    return content
+
+
+
+async def _run_ocr(
+    document_type: str,
+    raw_content: List[Dict[str, Any]],
+    fields: Optional[List[str]] = None,
+) -> dict:
+    """
+    Shared processing logic.
+
+    Args:
+        document_type: One of the keys in DOCUMENT_PROMPTS.
+        raw_content:   List of plain dicts with 'type' == 'text' or 'image_url'.
+        fields:        Optional list of field names to override defaults.
+
+    Returns:
+        {"success": True, "data": <extracted dict>}
+
+    Raises:
+        HTTPException on all known failure modes.
+    """
+    # ── Validate image count ───────────────────────────────────────────────────
+    image_count = sum(1 for item in raw_content if item.get("type") == "image_url")
+
+    if image_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error_type": "no_image_provided",
+                "message": "At least one image is required.",
+            },
+        )
+
+    if image_count > MAX_IMAGES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "error_type": "image_limit_exceeded",
+                "message": (
+                    f"Too many images. Maximum is {MAX_IMAGES}, "
+                    f"but {image_count} were provided."
+                ),
+            },
+        )
+
+    has_text = any(item.get("type") == "text" for item in raw_content)
+    if not has_text:
+        default_prompt = DEFAULT_USER_PROMPTS.get(document_type, DEFAULT_USER_PROMPTS["General"])
+        raw_content = [{"type": "text", "text": default_prompt}] + raw_content
+
+    clean_content = _sanitize_content(raw_content)
+    system_prompt = get_prompt(document_type, fields)
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=clean_content),
     ]
-    data = {"document_type": "General"}
-    r = requests.post(API_UPLOAD_URL, files=files, data=data)
-    print_result(r)
-    assert r.status_code == 415, f"Expected 415, got {r.status_code}"
-    print("  PASS: Unsupported type correctly rejected")
+    try:
+        response = model.invoke(messages, timeout=120)
+        extracted_data = json.loads(_clean_json_response(response.content))
+        return {"success": True, "data": extracted_data}
 
-def test_18_root_endpoint():
-    """Test 18: Root endpoint returns API info"""
-    r = requests.get(API_ROOT)
-    print_result(r)
-    assert r.status_code == 200, f"Expected 200, got {r.status_code}"
-    print("  PASS: Root endpoint works")
+    except json.JSONDecodeError as e:
+        logger.error("JSON parsing error: %s", e)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "success": False,
+                "error_type": "json_parse_error",
+                "message": "Model returned malformed JSON.",
+                "detail": str(e),
+            },
+        )
+
+    except Exception as e:
+        _handle_llm_exception(e)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ── LangGraph Pipeline for Multi-Page ──────────────────────────────────────
+
+class OCRState(TypedDict):
+    document_type: str
+    fields: Optional[List[str]]
+    custom_prompt: Optional[str]
+    images: List[Dict[str, Any]]
+    current_idx: int
+    page_results: List[Dict[str, Any]]
+    final_result: Dict[str, Any]
+    missing_fields: List[str]
+    table_context: str  # Structured table text extracted from PDF via pdfplumber
+
+
+def process_page_node(state: OCRState) -> Dict[str, Any]:
+    idx = state["current_idx"]
+    image_item = state["images"][idx]
+    
+    doc_type = state["document_type"]
+    fields = state["fields"]
+    custom_prompt = state["custom_prompt"]
+    table_context = state.get("table_context", "")
+    print("table_context: ",table_context)
+    raw_content = [image_item]
+    if custom_prompt:
+        prompt_text = custom_prompt
+    else:
+        prompt_text = DEFAULT_USER_PROMPTS.get(doc_type, DEFAULT_USER_PROMPTS["General"])
+
+    # Prepend table context to the prompt so the LLM can cross-reference
+    if table_context:
+        prompt_text = table_context + "\n" + prompt_text
+
+    raw_content.insert(0, {"type": "text", "text": prompt_text})
+        
+    system_prompt = get_prompt(doc_type, fields)
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=raw_content),
+    ]
+    
+    try:
+        response = model.invoke(messages)
+        extracted_data = json.loads(_clean_json_response(response.content))
+        print(f"\n=== DEBUG: Page {idx} Extracted Data ===\n{response.content}")
+    except Exception as e:
+        logger.error("Error extracting page %d: %s", idx, e)
+        extracted_data = {"error": str(e), "page": idx}
+        
+    return {
+        "page_results": state.get("page_results", []) + [extracted_data],
+        "current_idx": idx + 1
+    }
+
+def check_more_pages(state: OCRState) -> Literal["process_page", "aggregate_results"]:
+    if state["current_idx"] < len(state["images"]):
+        return "process_page"
+    return "aggregate_results"
+
+def check_missing_fields(state: OCRState) -> str:
+    last_result = state["page_results"][-1] if state["page_results"] else {}
+    required_fields = state.get("fields") or []
+
+    if not required_fields:
+        return "next_step"
+
+    missing = [
+        f for f in required_fields
+        if f not in last_result or last_result.get(f) in ["", None]
+    ]
+
+    if missing:
+        return "reprocess_page"
+
+    return "next_step"
+
+def reprocess_page_node(state: OCRState) -> Dict[str, Any]:
+    idx = state["current_idx"] - 1  # last processed page
+    image_item = state["images"][idx]
+    table_context = state.get("table_context", "")
+
+    required_fields = state.get("fields") or []
+    last_result = state["page_results"][-1]
+
+    missing = [
+        f for f in required_fields
+        if f not in last_result or last_result.get(f) in ["", None]
+    ]
+
+    if not missing:
+        return {}
+
+    prompt = f"""
+Some fields were missing from previous extraction:
+{missing}
+
+Re-analyze the image carefully.
+"""
+
+    if table_context:
+        prompt += f"\nAlso use the following structured table data extracted from the PDF:\n{table_context}\n"
+
+    prompt += """
+IMPORTANT:
+- Focus on tables, rows, structured data
+- Extract ONLY missing fields
+- Do NOT overwrite existing correct fields
+
+Return JSON only.
+"""
+
+    messages = [
+        SystemMessage(content="You are an expert at extracting data from tables in documents."),
+        HumanMessage(content=[
+            {"type": "text", "text": prompt},
+            image_item
+        ])
+    ]
+
+    try:
+        response = model.invoke(messages)
+        new_data = json.loads(_clean_json_response(response.content))
+        print(f"DEBUG page {idx} reprocess: {response.content}")
+    except Exception:
+        new_data = {}
+
+    merged = {**last_result, **new_data}
+    state["page_results"][-1] = merged
+
+    return {"page_results": state["page_results"]}
+
+def next_step(state: OCRState) -> str:
+    if state["current_idx"] < len(state["images"]):
+        return "process_page"
+    return "aggregate_results"
+
+def aggregate_node(state: OCRState) -> Dict[str, Any]:
+    page_results = state.get("page_results", [])
+    doc_type = state["document_type"]
+    
+    if not page_results:
+        return {"final_result": {}}
+        
+    system_prompt = (
+    f"""You are an expert data arbitration engine for {doc_type} documents.
+Multiple pages were OCR'd independently. Produce ONE final JSON object.
+RULES:
+- For each field, choose the most complete and credible value across all pages.
+- If the same field appears on multiple pages with DIFFERENT values, prefer:
+    1. The value that is more complete (not empty/partial).
+    2. The value from the page where that field would naturally appear
+       (e.g. totals from the last page, header info from the first page).
+- For array fields (e.g. line items, members), MERGE arrays from all pages
+  and deduplicate identical rows.
+- If a field is empty ("") or null on ALL pages, output "" for that field.
+- NEVER fabricate or infer values not present in any page result.
+- Return ONLY a raw JSON object. No markdown, no commentary, no code fences.
+"""
+    )
+    
+    user_content = json.dumps(page_results, indent=2)
+    print("\n=== DEBUG: Aggregation User Content ===\n", user_content)
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_content),
+    ]
+    
+    try:
+        response = model.invoke(messages)
+        final_data = json.loads(_clean_json_response(response.content))
+        print("""\n=== DEBUG: Aggregation Node ===\n""", response.content)
+    except Exception as e:
+        logger.error("Error in aggregation node: %s", e)
+        final_data = {"error": f"Aggregation failed: {str(e)}", "partial_results": page_results}
+        
+    return {"final_result": final_data}
+
+async def _run_langgraph_ocr(
+    document_type: str,
+    images: List[Dict[str, Any]],
+    fields: Optional[List[str]] = None,
+    custom_prompt: str = "",
+    pdf_bytes: Optional[bytes] = None,
+) -> dict:
+    # Extract table text from the PDF (if available) to help with small/dense tables
+    table_context = ""
+    if pdf_bytes:
+        table_context = _extract_tables_from_pdf(pdf_bytes)
+        if table_context:
+            logger.info("Table context extracted from PDF (%d chars)", len(table_context))
+        else:
+            logger.info("No tables found in PDF via pdfplumber")
+
+    workflow = StateGraph(OCRState)
+
+    workflow.add_node("process_page", process_page_node)
+    workflow.add_node("reprocess_page", reprocess_page_node)
+    workflow.add_node("next_step", lambda state: {})  # dummy node
+    workflow.add_node("aggregate_results", aggregate_node)
+
+    # START
+    workflow.add_edge(START, "process_page")
+
+    # AFTER process → check missing
+    workflow.add_conditional_edges(
+        "process_page",
+        check_missing_fields,
+        {
+            "reprocess_page": "reprocess_page",
+            "next_step": "next_step"
+        }
+    )
+
+    # AFTER retry → go to next decision
+    workflow.add_edge("reprocess_page", "next_step")
+
+    # NEXT STEP routing
+    workflow.add_conditional_edges(
+        "next_step",
+        next_step,
+        {
+            "process_page": "process_page",
+            "aggregate_results": "aggregate_results"
+        }
+    )
+
+    # END
+    workflow.add_edge("aggregate_results", END)
+        
+    app_graph = workflow.compile()
+    
+    initial_state = {
+        "document_type": document_type,
+        "fields": fields,
+        "custom_prompt": custom_prompt,
+        "images": images,
+        "current_idx": 0,
+        "page_results": [],
+        "final_result": {},
+        "table_context": table_context,
+    }
+    
+    try:
+        final_state = await app_graph.ainvoke(initial_state)
+        return {"success": True, "data": final_state.get("final_result", {})}
+    except Exception as e:
+        logger.error("LangGraph processing error: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail={"success": False, "error_type": "graph_error", "message": str(e)}
+        )
+
+
+def _handle_llm_exception(exc: Exception) -> None:
+    err = str(exc)
+
+    checks = [
+        (
+            "Error code: 400" in err or "BadRequestError" in err,
+            400,
+            "llm_bad_request",
+            _extract_inner_message(err),
+            "Input is likely too long. Reduce image size or text length.",
+        ),
+        (
+            "Error code: 401" in err,
+            401,
+            "llm_auth_error",
+            "Unauthorized — check your LLM API key.",
+            None,
+        ),
+        (
+            "Error code: 429" in err,
+            429,
+            "llm_rate_limit",
+            "LLM server is overloaded. Retry after a moment.",
+            None,
+        ),
+        (
+            "Error code: 503" in err or "Error code: 500" in err,
+            502,
+            "llm_server_error",
+            "LLM backend returned a server error.",
+            None,
+        ),
+        (
+            "ConnectionError" in type(exc).__name__ or "ConnectError" in err,
+            503,
+            "llm_unreachable",
+            f"Cannot connect to LLM server at {BASE_URL_LLM}.",
+            None,
+        ),
+        (
+            "TimeoutError" in type(exc).__name__ or "timed out" in err.lower(),
+            504,
+            "llm_timeout",
+            "LLM server did not respond in time. Try a smaller image.",
+            None,
+        ),
+    ]
+
+    for condition, status, error_type, message, hint in checks:
+        if condition:
+            detail: Dict[str, Any] = {
+                "success": False,
+                "error_type": error_type,
+                "message": message,
+            }
+            if hint:
+                detail["hint"] = hint
+            logger.error("vLLM error [%s]: %s", error_type, message)
+            raise HTTPException(status_code=status, detail=detail)
+
+
+    logger.error("Unhandled processing error [%s]: %s", type(exc).__name__, err)
+    raise HTTPException(
+        status_code=500,
+        detail={
+            "success": False,
+            "error_type": "internal_error",
+            "message": f"Unexpected error: {type(exc).__name__}",
+            "detail": err,
+        },
+    )
+
+
+def _extract_inner_message(error_str: str) -> str:
+    """Try to pull the human-readable message out of a vLLM 400 error string."""
+    try:
+        match = re.search(r"'message':\s*'([^']+)'", error_str)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return error_str
+
+
+@app.post(
+    "/ocr/process/upload",
+    summary="Extract document fields (multipart — file upload)",
+    tags=["OCR"],
+)
+async def process_ocr_upload(
+    files: List[UploadFile] = File(
+        ...,
+        description=(
+            f"One or more image/PDF files to process (max {MAX_IMAGES} pages/images). "
+            "Accepted formats: JPEG, PNG, WebP, GIF, TIFF, PDF."
+        ),
+    ),
+    document_type: DocumentType = Form(
+        default="General",
+        description="Document type. Options: " + ", ".join(DOCUMENT_PROMPTS.keys()),
+    ),
+    fields: Optional[List[str]] = Form(
+        default=[],
+        description=(
+            "Optional list of snake_case field names to extract. "
+            "Add each field name as a separate 'fields' parameter."
+        ),
+        example=None
+    ),
+    custom_prompt: Optional[str] = Form(
+        default="",
+        description=(
+            "Optional custom instruction prepended to the model input. "
+            "If omitted, the default instruction for the document_type is used."
+        ),
+    ),
+):
+    """
+    **Multipart mode** — upload image files directly from disk.
+
+    Send a `multipart/form-data` POST with:
+    - `files`: one or more image files
+    - `document_type`: e.g. `KTP` (default: `General`)
+    - `fields` *(optional)*: List of field names, e.g., pass multiple `-F "fields=name,nik"`
+    - `custom_prompt` *(optional)*: override the default user instruction
+
+    ```bash
+    curl -X 'POST' \
+        'http://localhost:5030/ocr/process/upload' \
+        -H 'accept: application/json' \
+        -H 'Content-Type: multipart/form-data' \
+        -F 'files=@ktp_2.png;type=image/png' \
+        -F 'document_type=KTP' \
+        -F 'fields=name,nik' \
+        -F 'custom_prompt=string'
+    ```
+    """
+    parsed_fields = fields
+    mime = None
+    pdf_bytes_store: Optional[bytes] = None  # store raw PDF bytes for table extraction
+    # ── Build content list from uploaded files ─────────────────────────────────
+    raw_content: List[Dict[str, Any]] = []
+
+    if custom_prompt:
+        raw_content.append({"type": "text", "text": custom_prompt})
+ 
+    for upload in files:
+        content_type = upload.content_type or "application/octet-stream"
+        raw_bytes = await upload.read()
+
+        if not raw_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "success": False,
+                    "error_type": "empty_file",
+                    "message": f"Uploaded file '{upload.filename}' is empty.",
+                },
+            )
+
+        try:
+            mime = content_type.split(";")[0].strip().lower()
+
+            if mime == "application/pdf":
+                pdf_bytes_store = raw_bytes  # save for pdfplumber table extraction
+                current_image_count = sum(1 for item in raw_content if item.get("type") == "image_url")
+                remaining_slots = MAX_IMAGES - current_image_count
+                
+                if remaining_slots > 0:
+                    pdf_items = _pdf_to_images(raw_bytes, max_pages=remaining_slots)
+                    raw_content.extend(pdf_items)
+            else:
+                raw_content.append(_file_to_content_item(raw_bytes, content_type))
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "success": False,
+                    "error_type": "file_read_error",
+                    "message": f"Could not process file '{upload.filename}': {e}",
+                },
+            )
+
+    try:
+        # Separate images and sanitize
+        images = [item for item in raw_content if item.get("type") == "image_url"]
+        images = _sanitize_content(images)
+        
+        # Extract custom prompt text if present
+        prompt_text = ""
+        for item in raw_content:
+            if item.get("type") == "text":
+                prompt_text = item.get("text", "")
+                break
+                
+        if len(images) > 1 or mime == "application/pdf":
+            return await _run_langgraph_ocr(document_type, images, parsed_fields, prompt_text, pdf_bytes=pdf_bytes_store)
+        else:
+            return await _run_ocr(document_type, raw_content, parsed_fields)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Unexpected error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+
+@app.get("/health", tags=["Utility"])
+async def health_check():
+    """Check connectivity to the vLLM backend."""
+    base_info = {
+        "vllm_max_model_len": 11000,
+        "max_image_size": "1024×1024",
+        "max_images_per_request": MAX_IMAGES,
+    }
+    try:
+        resp = requests.get(f"{BASE_URL_LLM}/health", timeout=5)
+        if resp.status_code == 200:
+            return {"status": "Healthy", "model_ready": True, **base_info}
+        return {
+            "status": f"Unhealthy (HTTP {resp.status_code})",
+            "model_ready": False,
+            **base_info,
+        }
+    except requests.exceptions.ConnectionError:
+        return {"status": "vLLM server not reachable", "model_ready": False, **base_info}
+    except requests.exceptions.Timeout:
+        return {"status": "vLLM server timeout", "model_ready": False, **base_info}
+    except Exception as e:
+        return {"status": f"Unexpected error: {e}", "model_ready": False, **base_info}
+
+
+@app.get("/", tags=["Utility"])
+async def root():
+    return {
+        "name": "Document OCR API",
+        "version": "3.1.0",
+        "supported_document_types": list(DOCUMENT_PROMPTS.keys()),
+        "endpoints": {
+            "json_ocr":    "POST /ocr/process",
+            "upload_ocr":  "POST /ocr/process/upload",
+            "health":      "GET  /health",
+            "docs":        "GET  /docs",
+        },
+    }
+
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  QWEN OCR API — COMPREHENSIVE TEST SUITE")
-    print("=" * 60)
-
-    # Check server health first
-    try:
-        h = requests.get(API_HEALTH, timeout=3)
-        print(f"\n  Server health: {h.json().get('status', 'unknown')}")
-    except Exception:
-        print("\n  WARNING: API server may not be running on localhost:5030!")
-
-    # # --- Success cases (need vLLM for full 200, but test API layer regardless) ---
-    # run_test("Test 01: General OCR — IJAZAH.jpg (base64 JSON)", test_01_general_base64)
-    # run_test("Test 02: KTP OCR — ktp_1.png (base64, no prompt)", test_02_ktp_base64_no_prompt)
-    # run_test("Test 03: Invoice OCR — invoice_example.PNG (base64 + prompt)", test_03_invoice_base64_with_prompt)
-    # run_test("Test 04: NPWP OCR — NPWP.png (base64)", test_04_npwp_base64)
-    # run_test("Test 05: KK OCR (base64)", test_05_kk_base64)
-    # run_test("Test 06: SIM OCR (base64)", test_06_sim_base64)
-    # run_test("Test 07: Quotation OCR (base64)", test_07_quotation_base64)
-    # run_test("Test 08: Fields Extraction (KTP)", test_08_fields_extraction)
-
-    # # --- Error/validation cases (should NOT reach vLLM) ---
-    # run_test("Test 09: REJECT external URL", test_09_url_rejected)
-    # run_test("Test 10: REJECT >5 images", test_10_image_limit_exceeded)
-    # run_test("Test 11: REJECT empty content", test_11_empty_content)
-    # run_test("Test 12: REJECT invalid document_type", test_12_invalid_document_type)
-    # run_test("Test 13: REJECT corrupted base64", test_13_invalid_base64)
-    # run_test("Test 14: REJECT no image provided", test_14_no_image_provided)
-
-    # --- Multipart upload cases ---
-    # run_test("Test 15: Upload success", test_15_upload_success)
-    # run_test("Test 16: Upload with fields and custom prompt", test_16_upload_with_fields)
-    # run_test("Test 16b: Upload multiple images", test_16b_upload_multiple_images)
-    # run_test("Test 16c: Upload PDF file", test_16c_upload_pdf)
-    # run_test("Test 17: Upload unsupported type", test_17_upload_unsupported_type)
-
-    # --- Other endpoints ---
-    run_test("Test 18: Root endpoint", test_18_root_endpoint)
-
-    print(f"\n{'='*60}")
-    print("  ALL TESTS DISPATCHED")
-    print(f"{'='*60}")
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5030)

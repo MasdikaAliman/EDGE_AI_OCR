@@ -262,6 +262,8 @@ class OCRState(TypedDict):
     current_idx: int
     page_results: List[Dict[str, Any]]
     final_result: Dict[str, Any]
+    missing_fields: List[str]
+
 
 def process_page_node(state: OCRState) -> Dict[str, Any]:
     idx = state["current_idx"]
@@ -298,6 +300,77 @@ def process_page_node(state: OCRState) -> Dict[str, Any]:
     }
 
 def check_more_pages(state: OCRState) -> Literal["process_page", "aggregate_results"]:
+    if state["current_idx"] < len(state["images"]):
+        return "process_page"
+    return "aggregate_results"
+
+def check_missing_fields(state: OCRState) -> str:
+    last_result = state["page_results"][-1] if state["page_results"] else {}
+    required_fields = state.get("fields") or []
+
+    if not required_fields:
+        return "next_step"
+
+    missing = [
+        f for f in required_fields
+        if f not in last_result or last_result.get(f) in ["", None]
+    ]
+
+    if missing:
+        return "reprocess_page"
+
+    return "next_step"
+
+def reprocess_page_node(state: OCRState) -> Dict[str, Any]:
+    idx = state["current_idx"] - 1  # last processed page
+    image_item = state["images"][idx]
+
+    required_fields = state.get("fields") or []
+    last_result = state["page_results"][-1]
+
+    missing = [
+        f for f in required_fields
+        if f not in last_result or last_result.get(f) in ["", None]
+    ]
+
+    if not missing:
+        return {}
+
+    prompt = f"""
+Some fields were missing from previous extraction:
+{missing}
+
+Re-analyze the image carefully.
+
+IMPORTANT:
+- Focus on tables, rows, structured data
+- Extract ONLY missing fields
+- Do NOT overwrite existing correct fields
+
+Return JSON only.
+"""
+
+    messages = [
+        SystemMessage(content="You are an expert at extracting data from tables in documents."),
+        HumanMessage(content=[
+            {"type": "text", "text": prompt},
+            image_item
+        ])
+    ]
+
+    try:
+        response = model.invoke(messages)
+        new_data = json.loads(_clean_json_response(response.content))
+        print(f"DEBUG page {idx} reprocess: {response.content}")
+    except Exception:
+        new_data = {}
+
+    merged = {**last_result, **new_data}
+    state["page_results"][-1] = merged
+
+    return {"page_results": state["page_results"]}
+
+def next_step(state: OCRState) -> str:
     if state["current_idx"] < len(state["images"]):
         return "process_page"
     return "aggregate_results"
@@ -350,21 +423,41 @@ async def _run_langgraph_ocr(
     custom_prompt: str = ""
 ) -> dict:
     workflow = StateGraph(OCRState)
-    
+
     workflow.add_node("process_page", process_page_node)
+    workflow.add_node("reprocess_page", reprocess_page_node)
+    workflow.add_node("next_step", lambda state: {})  # dummy node
     workflow.add_node("aggregate_results", aggregate_node)
-    
+
+    # START
     workflow.add_edge(START, "process_page")
+
+    # AFTER process → check missing
     workflow.add_conditional_edges(
         "process_page",
-        check_more_pages,
+        check_missing_fields,
+        {
+            "reprocess_page": "reprocess_page",
+            "next_step": "next_step"
+        }
+    )
+
+    # AFTER retry → go to next decision
+    workflow.add_edge("reprocess_page", "next_step")
+
+    # NEXT STEP routing
+    workflow.add_conditional_edges(
+        "next_step",
+        next_step,
         {
             "process_page": "process_page",
             "aggregate_results": "aggregate_results"
         }
     )
+
+    # END
     workflow.add_edge("aggregate_results", END)
-    
+        
     app_graph = workflow.compile()
     
     initial_state = {
@@ -526,13 +619,13 @@ async def process_ocr_upload(
     ```
     """
     parsed_fields = fields
-
+    mime = None
     # ── Build content list from uploaded files ─────────────────────────────────
     raw_content: List[Dict[str, Any]] = []
 
     if custom_prompt:
         raw_content.append({"type": "text", "text": custom_prompt})
-
+ 
     for upload in files:
         content_type = upload.content_type or "application/octet-stream"
         raw_bytes = await upload.read()
@@ -549,6 +642,7 @@ async def process_ocr_upload(
 
         try:
             mime = content_type.split(";")[0].strip().lower()
+
             if mime == "application/pdf":
                 current_image_count = sum(1 for item in raw_content if item.get("type") == "image_url")
                 remaining_slots = MAX_IMAGES - current_image_count
@@ -582,7 +676,7 @@ async def process_ocr_upload(
                 prompt_text = item.get("text", "")
                 break
                 
-        if len(images) > 1:
+        if len(images) > 1 or mime == "application/pdf":
             return await _run_langgraph_ocr(document_type, images, parsed_fields, prompt_text)
         else:
             return await _run_ocr(document_type, raw_content, parsed_fields)
